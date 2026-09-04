@@ -110,7 +110,7 @@ an external KMS key with a genuine lifecycle is attached to a provider workspace
 | C8 | Top-ups | Always approver-gated; engineering effort goes into approval **latency** | User decision. Mitigated by actionable cards, an SLI, and delegate escalation (§14) |
 | C9 | Seats vs API | Workload class decides; provisioning refuses an API entitlement for plainly interactive use | The guardrail lives in the tool, not in a policy document |
 | C10 | Vendor neutrality | Native provider protocols + git-governed **model alias registry**, eval-gated | Reduces switching cost without lowest-common-denominator feature loss (§10) |
-| C11 | Agent identity | Shared registry and `AgentIdentity`; **two separate runtime planes** | Correlation without a shared outage domain (§4.2) |
+| C11 | Agent identity | Shared registry and `AgentIdentity`; **two separate runtime planes** | Correlation without a shared outage domain (§5.2) |
 | C12 | Shadow AI | Network egress deny-by-default, allowlist generated from the provider registry | Makes "mandatory" a property of the network. Managed estate only — stated as a limit (§12) |
 | C13 | kore.ai | A governed **consumer**: per-project gateway credential, one provider workspace per project | Per-project *provider keys* would require Console work per project (§22). This keeps provisioning self-service and removes any second egress path |
 | C14 | Sub-attribution | Caller-asserted end user recorded with a `derived`/`declared`/`granted` attestation tier | Reuses sibling §9.1. Throttle on an assertion; never authorize on one (§9.3) |
@@ -209,6 +209,113 @@ group-cache freshness, converting an authorization staleness event into a
 company-wide inference outage.
 
 Correlation is achieved instead by shared `trace_id` and `intent.id` (§15.4).
+
+### 5.3 System interaction map
+
+Where §5.1 shows the gateway's internals, this shows the estate. Every edge is
+labelled with the **data** that crosses it, and each system of record owns
+exactly one truth — no value is duplicated into a second system where it can go
+stale.
+
+```mermaid
+flowchart TB
+    subgraph sor["SYSTEMS OF RECORD — one truth each, never duplicated"]
+        direction LR
+        wd[("Workday<br/>cost centre · project id<br/>manager · joiner-mover-leaver")]
+        entra[("Entra ID<br/>identity · groups<br/>workload identities")]
+        git[("Git registries<br/>templates · aliases · providers<br/>pricing · exceptions")]
+    end
+
+    subgraph gov["GOVERNANCE PLANE — design time, never in the request path"]
+        direction LR
+        eig["Entra ID Governance<br/>access packages<br/>approvals · access reviews"]
+        prov["Provisioning automation<br/>the ONLY minting path"]
+        est[("Entitlement store<br/>instances · lifecycle state")]
+        ci["CI gates"]
+        img[["Image<br/>registries baked in"]]
+    end
+
+    subgraph cons["CONSUMERS"]
+        direction LR
+        seat["Human seats<br/>no credential"]
+        wl["Workloads · CI/CD<br/>OIDC federated"]
+        kore["kore.ai projects<br/>gateway credential"]
+        agent["Agents"]
+        part["Design partners<br/>restricted tier"]
+    end
+
+    subgraph rt["RUNTIME PLANE"]
+        direction LR
+        aigw["AI Gateway<br/>meter · enforce · route"]
+        mcpgw["MCP Gateway<br/>authorize tool calls"]
+        fw{{"Egress control<br/>API domains: gateway only<br/>product domains: SSO seats"}}
+    end
+
+    subgraph prv["AI PROVIDERS"]
+        direction LR
+        anth[("Anthropic<br/>workspaces · WIF · service accounts")]
+        oai[("OpenAI")]
+    end
+
+    subgraph ev["EVIDENCE PLANE"]
+        direction LR
+        worm[("WORM audit<br/>never sampled")]
+        otel[("Azure Monitor<br/>OTel · sampled")]
+        fin["Finance<br/>showback · reconciliation"]
+    end
+
+    denied(["DENIED"])
+
+    wd -->|"cost centre · project · CC owner"| eig
+    wd -->|"termination · transfer events"| prov
+    entra -->|"identity · group membership"| eig
+    eig -->|"approved grant"| prov
+    git --> ci --> img
+    git -.->|"generates allowlist"| fw
+    prov -->|"create workspace<br/>create federation rule"| anth
+    prov -->|"write instance"| est
+    prov -->|"register budget · criticality · aliases"| aigw
+    img -.->|"deploy"| aigw
+    img -.->|"deploy"| mcpgw
+
+    entra -->|"AgentIdentity · trust tier"| aigw
+    entra -->|"AgentIdentity · trust tier"| mcpgw
+    est -->|"entitlement + state, cached"| aigw
+
+    wl & kore & part -->|"authenticated request"| aigw
+    agent -->|"model calls"| aigw
+    agent -->|"tool calls"| mcpgw
+    wl & kore & part -->|"attempted direct API call"| fw
+    fw -->|"source is not the gateway"| denied
+    seat -->|"SSO · product domain"| fw
+    aigw -->|"federated token · no stored secret"| fw
+    fw -->|"permitted"| anth
+    fw -->|"permitted"| oai
+
+    aigw -->|"audit + cost<br/>trace_id · intent_id"| worm
+    mcpgw -->|"audit<br/>trace_id · intent_id"| worm
+    aigw --> otel
+    worm -->|"attributed spend"| fin
+    anth -.->|"invoice per workspace"| fin
+    fin -.->|"variance alarm"| prov
+```
+
+Four properties are deliberate and worth reading off the diagram:
+
+**Workday reaches the runtime plane only through provisioning.** There is no
+edge from Workday to either gateway. HR data is governance-plane input, which is
+what keeps it clear of the sibling spec's §18 deferral (§2).
+
+**The egress control's allowlist is generated from the provider registry**, so
+onboarding a provider and opening its network path are one reviewed change and
+cannot drift apart.
+
+**`agent` is the only consumer touching both gateways**, under one
+`AgentIdentity`. That single fact is what makes the §15.4 join possible.
+
+**The invoice edge runs to Finance, not to the gateway.** Cost is computed at
+request time (C-P5); the invoice is used only to *check* that computation, and a
+variance raises an alarm rather than silently correcting the record.
 
 ---
 
@@ -479,6 +586,46 @@ runbook.
 
 ---
 
+### 9.5 The credential chain, end to end
+
+The concrete form of C1 and AI-I11. Read it as an assertion to be tested, not an
+illustration: **at no hop does a long-lived secret exist.**
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant W as AKS workload
+    participant E as Entra ID
+    participant G as AI Gateway
+    participant A as Anthropic
+
+    Note over W,A: No long-lived secret at any hop (AI-I11)
+
+    W->>W: read projected service-account JWT from disk
+    W->>E: workload identity federation exchange
+    E-->>W: access token, audience = AI Gateway
+    W->>G: request + bearer token
+    G->>G: resolve entitlement · alias · classification · budget
+    G->>E: token for the gateway's own managed identity
+    E-->>G: assertion JWT
+    G->>A: POST /v1/oauth/token (federation rule -> service account)
+    A-->>G: OAuth token, ~600s, workspace-scoped
+    G->>A: POST /v1/messages
+    A-->>G: stream + provider-reported usage
+```
+
+Two consequences that are easy to miss:
+
+**The gateway is not a secret store.** It holds no Anthropic key to steal,
+rotate, or leak. Compromising the gateway yields at most a 600-second
+workspace-scoped token, and revocation is archiving the federation rule (C16).
+
+**Rungs 2 and 3 of §9.2 are the only deviations.** A kore.ai gateway credential
+and a Key Vault provider key are the sole long-lived secrets in the system, both
+declared in the exception register with a mandatory expiry. Enumerating Key
+Vault and the register and asserting the two sets match is how AI-I11 is tested.
+
+
 ## 10. Vendor neutrality — the model alias registry
 
 The only place a provider model ID appears.
@@ -578,6 +725,24 @@ The mitigating control is not technical: it is C-P4 — seats (§9.1) must make 
 sanctioned path genuinely easier than the unsanctioned one. This is why §21.3
 forbids shipping the egress block before the seats.
 
+### 12.1 The allowlist is not one list
+
+Two classes of provider endpoint. Conflating them either breaks seats or leaves
+a hole, so the registry distinguishes them.
+
+| Class | Serves | Permitted source |
+|---|---|---|
+| Provider **API** endpoints | programmatic inference | the gateway's egress identity, and nothing else |
+| Provider **product** endpoints | Claude Enterprise web, Claude Code under a seat | managed devices with an authenticated seat |
+
+**Honest caveat, per P4.** Where a provider serves both classes from the same
+hostname, the network cannot separate them by destination and this control
+degrades to "the domain is reachable from managed devices." That is weaker than
+the table implies, and it must be written into the runbook rather than assumed
+away. The compensating control in that case is not technical: a personal API key
+still requires a personal account and a personal payment method, which the
+procurement control reaches even when the firewall does not. **V7 (§22).**
+
 Complementary controls, owned outside this platform and named here so the gap is
 explicit rather than assumed closed: SSE/CASB visibility, and a procurement
 control on reimbursement for personal AI subscriptions.
@@ -625,6 +790,42 @@ at once, far too late to matter.
 Showback by cost centre, project, entitlement, and — at `declared` tier —
 end user. Owners see their own; cost-centre owners see their centre; finance
 sees all.
+
+### 13.5 Attribution lineage
+
+The chain of custody for a cost centre, from HR record to reconciled invoice
+line. C-P5 in diagram form: the value is stamped on the way *in*, and the
+invoice is only ever used to check the result.
+
+```mermaid
+flowchart LR
+    A[("Workday<br/>CC-4471 · PRJ-10023")] -->|"resolved on the request form"| B["Access package request"]
+    B -->|"approved"| C["Entitlement instance<br/>ent-7f2a"]
+    C -->|"registered at provisioning"| D["AI Gateway"]
+    D -->|"stamped on EVERY call"| E["Audit event<br/>workday.cost_centre · price_table_version"]
+    U["End-user assertion<br/>declared tier only"] -.->|"sub-attribution"| E
+    E -->|"usage x price table"| F["Computed cost"]
+    F --> G["Showback<br/>cost centre · project<br/>entitlement · end user"]
+    F --> H{{"Monthly reconciliation<br/>per workspace"}}
+    I[("Provider invoice<br/>per workspace")] --> H
+    H -->|"within threshold"| K(["Accepted"])
+    H -->|"variance over threshold"| J(["ALARM<br/>never silently adjusted"])
+```
+
+Three points the diagram is making:
+
+**The `price_table_version` travels with the audit event.** Without it a cost
+cannot be reproduced months later and every dispute becomes archaeology.
+
+**C15 is what makes the reconciliation edge a comparison rather than an
+allocation exercise.** One workspace per entitlement means the provider's invoice
+line and the gateway's computed total describe the same set of calls. Without
+per-entitlement workspaces this join does not exist and the whole right-hand side
+of the diagram degrades to guesswork.
+
+**The end-user edge is dotted and one-way.** It enriches attribution at
+`declared` tier and touches nothing else — never an authorization input (AI-I3).
+
 
 ---
 
@@ -928,6 +1129,7 @@ recorded as an open question rather than an assumption, per P4.
 | **V4** | Whether OpenAI's admin surface supports programmatic project and key creation, and whether it offers OIDC federation equivalent to WIF | T1 for the second provider | AI Platform |
 | **V5** | Entra ID Governance access-package support for Workday-sourced custom attributes on the request form | T3 | Identity team |
 | **V6** | Provider zero-retention terms confirmed in contract for every alias marked `zero_retention_required` | T6 (partners) | Provider owner + Legal |
+| **V7** | Whether provider API and product endpoints are separable by hostname at the egress proxy (§12.1) | T5 | Network + AI Platform |
 
 V1 and V2 are the two that could change a decision. The remainder change effort,
 not architecture.
