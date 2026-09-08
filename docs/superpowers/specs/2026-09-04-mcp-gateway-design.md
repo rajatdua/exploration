@@ -1,6 +1,6 @@
 # MCP Gateway — Design
 
-**Date:** 2026-09-04
+**Date:** 2026-09-04 (revised 2026-09-08)
 **Status:** Approved for implementation planning
 **Scope:** Slice one — a thin vertical slice through the Gateway
 
@@ -15,299 +15,189 @@ governed by declaration and traceable end to end along the chain:
 human → agent → intent → tool → resource → action → destination
 ```
 
-The system has three subsystems. This document specifies **only the Gateway
-slice**; the others get their own spec and plan cycles.
-
-| Subsystem | Role | This spec |
-|---|---|---|
-| **Orchestrator** | Design-time. Generates *proposed* MCP definitions from service artifacts (proto, OpenAPI) using an LLM. Never in the request path. | Contract only (§18) |
-| **Definition** | The declarative contract. YAML in git, governed by PR. | **Yes** |
-| **Gateway** | Runtime. Loads definitions, serves MCP, executes calls, resolves identity, records the chain. | **Yes** |
+The system has three subsystems. This document specifies the **Definition**
+format and the **Gateway**. The **Orchestrator** (design-time LLM that proposes
+definitions from proto/OpenAPI, never in the request path) is out of scope and
+gets its own spec.
 
 ---
 
 ## 2. Principles
 
-These are load-bearing. Where a later decision seems arbitrary, it traces back
-to one of these.
-
-1. **Declare, don't infer.** Every element of the traceability chain is a
-   declared field in a definition, not something reconstructed at runtime from
-   logs. This is what makes the audit record trustworthy.
-2. **Prefer destinations that enforce their own authorization.** Where a
-   destination cannot, the Gateway becomes the sole authority over data whose
-   sensitivity it does not own — a confused deputy. That requires field-level
-   authorization, which is a subsystem, not a feature.
-3. **Human-in-the-loop is a declared authorization step, never a fallback for
-   missing information.** Uncertainty resolves to deny, not to an interrupt.
-4. **Never claim a stronger guarantee than the mechanism delivers.** An audit
-   trail that overstates itself is worse than one that admits its limits.
-5. **Fail closed, fail loudly, and be trivially debuggable.** A fail-closed
-   system dies from unexplained denials more often than from outages.
-6. **Enforce architecture in CI.** Boundaries that are not mechanically
-   enforced decay within a few sprints.
-7. **KISS / DRY / declarative.** One schema generates validation, types, docs,
-   review routing, and (later) the UI. Adding a tool means adding data, not code.
+1. **Declare, don't infer.** Every element of the chain is a declared field in a
+   definition, not something reconstructed from logs.
+2. **Destinations enforce their own authorization.** The Gateway delegates the
+   human's identity downstream; it never becomes the authority over data it does
+   not own.
+3. **Uncertainty resolves to deny, never to a human prompt.** An undecidable
+   case is a policy gap to fix in git.
+4. **Never claim a stronger guarantee than the mechanism delivers.**
+5. **Fail closed, fail loudly, be trivially debuggable.**
+6. **Enforce architecture in CI.**
+7. **Adding a tool means adding data, not code.** One schema generates
+   validation, types, docs, and review routing.
 
 ---
 
-## 3. Decision record
+## 3. Decisions
 
-| # | Decision | Choice | Rationale |
-|---|---|---|---|
-| D1 | Build order | Thin vertical slice through the Gateway | Proves the hardest risk (delegated identity + traceability) first; makes the schema empirical |
-| D2 | Slice destinations | Internal Azure/Entra only | Destination-enforced authorization (P2) |
-| D3 | Intent | Unsigned intent claims recorded in the audit event; signing STS deferred (§18) | Nothing in slice one verifies a signed token, so the signing infrastructure would serve zero verifiers |
-| D4 | Wire protocol | MCP OAuth 2.1 session + optional `_meta` intent | Non-forgeable human identity; degrades for vanilla clients |
-| D5 | Definition format | YAML in git; JSON Schema as meta-schema | PR-gated governance with zero new infrastructure |
-| D6 | Policy engine | Cedar, behind a `PolicyDecisionPoint` port | In-process (no PDP network hop); statically analyzable |
-| D7 | Language | Python (FastAPI + FastMCP); Go dataplane extraction behind a written trigger (§17.3) | One toolchain now; known ceiling made explicit |
-| D8 | Traceability | OTel spans **and** a separate audit log in immutable (WORM) storage | Sampling is correct for debugging and fatal for audit |
-| D9 | Binding | Typed protocol connectors, declaratively configured | Avoids inventing an expression language |
-| D10 | Distribution | Definitions baked into the image; `DefinitionSource` port | Image digest ↔ git SHA gives unambiguous "what was live when" |
-| D11 | Testing | Per-tool declarative fixtures + global invariants | Adding a tool adds data, not tests |
-| D12 | Client registration | Pre-registered OAuth clients **and** mTLS workload identities | Entra does not support OAuth DCR |
-| D13 | UI-tier review gate | Static gates now; behavioral eval as a triggered phase | Cannot build a meaningful eval corpus before there are tools |
-| D14 | Escalation | **Deferred** (§18). Slice one is `allow \| deny(remediation)`; write access requires standing Entra group authorization | A rare path built before it is needed is rarely built right |
-| D15 | Degradation | Fail closed with local durable WAL + async queue drain | Sink outage must not be a traffic outage |
-| D16 | Tamper evidence | Azure immutable blob with legal hold; hash chains **deferred** (§18) | WORM already provides the guarantee; an attacker with pod access controls the chain computation too, so chains add machinery without adding defence |
-| D17 | Preconditions (`prior_read`) | **Deferred** (§18) | Requires a queryable audit index in the request path — a subsystem, not a field |
+| # | Decision | Choice |
+|---|---|---|
+| D1 | Build order | Thin vertical slice: two tools, one surface, one client, one destination |
+| D2 | Destinations | Internal Azure services behind Entra only; the destination authorizes the human (P2) |
+| D3 | Protocol | MCP revision `2026-07-28`, Streamable HTTP only, one route per surface; OAuth 2.1 validated on every request |
+| D4 | Definitions | YAML in git, JSON Schema meta-schema, PR-gated by CODEOWNERS, baked into the container image |
+| D5 | Policy | Cedar, in-process, behind a port; statically analysed in CI |
+| D6 | Language | Python 3.12, FastAPI + FastMCP. A Go rewrite of dispatch happens only if measured Gateway p99 overhead exceeds 75 ms at production load |
+| D7 | Identity | Gateway is an OAuth 2.1 resource server for Entra; downstream via Entra On-Behalf-Of; subject key is `(tid, oid)`; groups read from the token |
+| D8 | Principals | **Human only** in slice one. Workload (mTLS) principals are deferred with the credential path they need |
+| D9 | Intent | One tier: `derived`, one id per call, unsigned, recorded. Declared and granted intent arrive with the Enterprise SDK |
+| D10 | Clients | Pre-registered Entra app registrations in `definitions/clients/registry.yaml` |
+| D11 | Outcomes | `allow` or `deny(reason, remediation)`. Write access is standing Entra group membership. Escalation is deferred |
+| D12 | Idempotency | Declared per write tool; the Gateway refuses a replay of a non-idempotent call within a short window |
+| D13 | Traceability | OTel to Azure Monitor (sampled) **and** an audit log written ahead of every side effect to a local WAL, drained to immutable blob (never sampled) plus a Log Analytics index |
+| D14 | Payload fingerprints | Keyed HMAC-SHA256 under a Key Vault key, never a bare digest |
+| D15 | Tamper evidence | Azure immutable blob under a locked time-based retention policy. No application hash chains |
+| D16 | Degradation | Fail closed. WAL on a per-pod PersistentVolume; a sink outage is not a traffic outage |
+| D17 | Testing | Per-tool declarative fixtures plus a named invariant suite |
 
 ---
 
-## 4. Domain architecture
-
-**Ports and adapters**, chosen for three specific reasons: domains become
-independently testable, the Go extraction (D7) has a ready seam, and the
-definition schema stays free of I/O concerns.
+## 4. Components
 
 ### 4.1 Component view
 
-Note the two planes. The **governance plane** is design-time and never in the
-request path; the **runtime plane** never writes to git. The only coupling
-between them is a container image (D10).
+Two planes. The governance plane is design-time and never in the request path.
+The runtime plane never writes to git. The only coupling is the container image.
 
 ```mermaid
 flowchart TB
-    subgraph consumers["Consumers"]
-        claude["Claude / MCP client<br/>(OAuth 2.1, pre-registered)"]
-        vendor["Third-party vendor<br/>(OAuth 2.1)"]
-        wl["Batch workload<br/>(mTLS, no human)"]
-        sdk["Enterprise SDK<br/>(deferred §18)"]
+    client["Claude Desktop<br/>MCP client, OAuth 2.1"]
+
+    subgraph gov["GOVERNANCE PLANE"]
+        pr["Pull request"] --> ci["CI gates"] --> repo[("definitions/ policies/<br/>schemas/ — git")] --> img[["Container image"]]
     end
 
-    subgraph gov["GOVERNANCE PLANE — design time, not in request path"]
-        orch["Orchestrator<br/>(deferred §18)<br/>proto/OpenAPI → proposal"]
-        ui["Config UI<br/>(deferred §18)<br/>prose + surfaces only"]
-        pr["Pull request"]
-        ci["CI gates §17.1<br/>validate · prose lint · ScanProvider<br/>Cedar static analysis · tests"]
-        repo[("definitions/ · policies/<br/>schemas/ — git")]
-        img[["Container image<br/>definitions baked in"]]
-    end
-
-    subgraph rt["RUNTIME PLANE"]
-        app["apps/gateway<br/>transport · session · wiring only"]
-        disp["libs/dispatch<br/>§12 steps 5–12"]
-
-        subgraph adapters["Adapters (behind libs/core ports)"]
-            defsrc["DefinitionSource"]
+    subgraph rt["RUNTIME PLANE — AKS StatefulSet"]
+        app["apps/gateway<br/>transport · routing · wiring"]
+        disp["libs/dispatch"]
+        subgraph ports["Adapters behind libs/core ports"]
             pres["PrincipalResolver"]
-            ires["IntentResolver"]
-            pdp["PolicyDecisionPoint<br/>Cedar, in-process"]
-            cred["CredentialProvider<br/>entra_obo"]
-            conn["Connector<br/>grpc · rest"]
-            audit["AuditSink<br/>WAL + fsync → drain"]
+            pdp["PolicyDecisionPoint (Cedar)"]
+            cred["CredentialProvider (Entra OBO)"]
+            conn["Connector (gRPC)"]
+            audit["AuditSink (WAL on PVC)"]
         end
     end
 
     subgraph azure["Azure"]
-        entra["Entra ID<br/>AS · OBO · groups"]
-        kv["Key Vault"]
-        hr["Internal service<br/>hr-core (gRPC)"]
+        entra["Entra ID"]
+        kv["Key Vault<br/>HMAC key"]
+        hr["hr-core (gRPC)"]
+        blob["Immutable blob<br/>audit system of record"]
+        la["Log Analytics<br/>audit index"]
+        mon["Azure Monitor<br/>OTel"]
     end
 
-    subgraph sinks["Sinks"]
-        otel["Azure Monitor<br/>OTel · sampled"]
-        eh["Event Hubs → immutable blob<br/>WORM · never sampled"]
-    end
-
-    claude & vendor & wl & sdk -->|"Streamable HTTP<br/>/mcp/{surface}"| app
-    orch -.-> pr
-    ui -.-> pr
-    pr --> ci --> repo --> img -.->|deploy| app
-
+    client -->|"/mcp/{surface}"| app
+    img -.->|deploy| app
     app --> disp
-    disp --> defsrc & pres & ires & pdp & cred & conn & audit
-    defsrc -.reads.-> img
+    disp --> pres & pdp & cred & conn & audit
     pres --> entra
     cred --> entra
-    cred --> kv
     conn --> hr
-    pdp -. "entity data: TTL + max-staleness" .-> entra
-    audit --> eh
-    app --> otel
-
-    classDef deferred stroke-dasharray: 5 5
-    class orch,ui,sdk deferred
+    audit --> kv
+    audit --> blob
+    audit --> la
+    app --> mon
 ```
 
-### 4.2 Request sequence
+### 4.2 Component list
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant C as MCP client
-    participant G as apps/gateway
-    participant D as libs/dispatch
-    participant P as Cedar PDP
-    participant A as AuditSink (WAL)
-    participant X as CredentialProvider
-    participant B as hr-core
+| Component | Kind | Responsibility | State |
+|---|---|---|---|
+| `apps/gateway` | Service | Streamable HTTP MCP server. One route per surface at `/mcp/{surface}`. Validates the OAuth token on every request. Composes adapters onto ports at startup. Contains no business logic. | none |
+| `libs/core` | Library | Types (`Principal`, `AgentIdentity`, `IntentClaims`, `ToolCall`, `Resource`, `Action`, `Destination`, `Decision`, `AuditEvent`) and the five ports. Zero dependencies. | — |
+| `libs/definition` | Library | Loads and validates definitions: JSON Schema, cross-layer rules (§5.7), gRPC descriptor checks. No I/O beyond reading files. | — |
+| `libs/dispatch` | Library | Steps 5–11 of the request lifecycle (§12). The orchestration lives here, not in the app. | — |
+| `libs/identity` | Library | `PrincipalResolver`: validates the Entra JWT, extracts `(tid, oid)`, `sub`, `groups`, `iat`. `CredentialProvider`: Entra On-Behalf-Of exchange using the pod's workload identity, one exchange per call. | none |
+| `libs/policy` | Library | `PolicyDecisionPoint`: Cedar via Python bindings. Static analyser that proves named properties over the policy set in CI. | — |
+| `libs/connectors` | Library | `Connector`: gRPC adapter that builds requests from committed descriptor sets and the declared field maps. | — |
+| `libs/audit` | Library | `AuditSink`: append-only WAL with fsync, drain worker to immutable blob and Log Analytics, payload HMAC, OTel wiring. | WAL on PVC |
+| `definitions/` | Data | Tools (five files each), destinations, surfaces, client registry. | git |
+| `policies/` | Data | Cedar policy set and schema. | git |
+| `schemas/` | Data | JSON Schema meta-schema; connector binding fragments. Source of every generated artifact. | git |
+| `tools/fakes/` | Test substrate | Reference gRPC backend and a fake OIDC provider issuing Entra-shaped tokens. Normative for all tests. | — |
+| `just explain` | Operator CLI | Reproduces the full chain and determining policy for a `trace_id` from the index or the local WAL. | — |
+| Entra ID | External | Authorization server, OBO token exchange, `groups` claim. | — |
+| Key Vault | External | One key: the payload HMAC key. | — |
+| Immutable blob | External | Audit system of record, locked time-based retention. | — |
+| Log Analytics | External | Queryable, non-authoritative audit index, shorter retention. | — |
+| Azure Monitor | External | OTel traces, sampled. | — |
+| `hr-core` | External | First destination. Internal gRPC service behind Entra. | — |
 
-    C->>G: connect (OAuth 2.1 / mTLS)
-    G->>G: PrincipalResolver → human | workload<br/>registry → agent + trust_tier
-    C->>G: initialize
-    G-->>C: serverInfo + surface.instructions
-    C->>G: tools/list
-    G->>P: visibility decision per tool
-    G-->>C: permitted tools + generated annotations
-    C->>G: tools/call (name, args, _meta.intent?)
-    G->>D: dispatch
-    D->>D: resolve declaration + effective config
-    D->>D: IntentResolver → IntentClaims (derived | declared)
-    D->>P: decide(principal, action, resource, context)
+The Gateway has exactly **one** stateful runtime component: the WAL. There is no
+database, no session store, and no credential cache.
 
-    alt deny
-        P-->>D: deny(reason, remediation)
-        D->>A: open+close (outcome=deny)
-        D-->>C: error + reason + remediation + trace_id
-    else allow
-        P-->>D: allow
-        D->>A: open() — fsync BEFORE any side effect
-        D->>X: resolve(claims) — cache key includes intent.id
-        X-->>D: short-lived OBO token
-        D->>B: execute per binding + config
-        B-->>D: response
-        D->>D: response_map → outputSchema (drop undeclared)
-        D->>A: close(outcome)
-        D-->>C: structured result
-    end
-```
-
-The `alt` branch is the point of the diagram: **a deny is audited exactly as
-thoroughly as an allow**, and neither path can reach `B` without a prior fsynced
-`open` (invariant I1).
-
-### 4.3 Definition lifecycle
-
-```mermaid
-stateDiagram-v2
-    [*] --> Proposed: Orchestrator (§18)<br/>or hand-authored
-    Proposed --> InReview: PR opened
-    InReview --> Rejected: gate fails
-    Rejected --> Proposed: revise
-    InReview --> Approved: gates pass +<br/>CODEOWNERS approve by path
-    Approved --> Live: merge → image → rolling deploy
-    Live --> InReview: prose / composition / config change (UI)
-    Live --> Retired: removed from every surface
-    Retired --> [*]
-
-    note right of InReview
-        Gates by edit tier §5.2
-        prose → lint + ScanProvider
-        composition → Cedar static analysis
-        binding → destination allowlist
-        governance → @security-team
-    end note
-```
-
-### 4.4 Repository layout
+### 4.3 Repository layout
 
 ```
-libs/core/                  # PURE. Zero dependencies. The DRY spine.
-  types.py                  #   Principal, AgentIdentity, IntentClaims, ToolCall,
-                            #   Resource, Action, Destination, Decision, AuditEvent
-  ports.py                  #   DefinitionSource, PolicyDecisionPoint, PrincipalResolver,
-                            #   IntentResolver, CredentialProvider, Connector,
-                            #   AuditSink, ScanProvider
+libs/core/                  # PURE. Zero dependencies.
+  types.py
+  ports.py                  #   PrincipalResolver, PolicyDecisionPoint, CredentialProvider,
+                            #   Connector, AuditSink
+libs/definition/            # load, parse, validate
+libs/policy/                # Cedar adapter + static analyser
+libs/identity/              # PrincipalResolver, CredentialProvider (entra_obo)
+libs/connectors/            # grpc
+libs/audit/                 # AuditEvent, WAL, drain worker, HMAC, OTel
+libs/dispatch/              # §12 steps 5–11
 
-libs/definition/            # schema load, parse, validate, cross-layer rules. No I/O.
-libs/policy/                # Cedar adapter + static analyzer
-libs/identity/              # PrincipalResolver; IntentResolver;
-                            #   CredentialProvider adapters: entra_obo
-libs/connectors/            # Connector adapters: grpc, rest. Each ships a schema fragment.
-libs/audit/                 # AuditEvent, WAL + fsync, drain worker; OTel wiring
-libs/dispatch/              # THE ORCHESTRATION OF §12. Steps 5–14 live here, not in the app.
+apps/gateway/               # MCP server: transport, routing, wiring only
 
-apps/gateway/               # MCP server: transport, session, wiring. Near-zero logic.
-
-definitions/                # DATA, not code.
-  destinations/             #   egress allowlist            @security-team
-  tools/<service>/<tool>/   #   prompt | interface | binding | governance | fixtures
-  surfaces/<name>.yaml      #   published MCP servers
-  clients/registry.yaml     #   client_id → agent, auth method, trust tier
-policies/                   # Cedar policy set               @security-team
-schemas/                    # JSON Schema — source of truth for all generated artifacts
-tools/fakes/                # reference backend + fake OIDC provider (normative for tests)
+definitions/
+  destinations/<name>.yaml  # egress allowlist                   @security-team
+  destinations/<name>.desc  # gRPC FileDescriptorSet, built in CI from the service proto
+  tools/<service>/<tool>/   # prompt | interface | binding | governance | fixtures
+  surfaces/<name>.yaml      # published MCP servers
+  clients/registry.yaml     # client_id → agent, trust tier      @security-team
+policies/                   # Cedar                              @security-team
+schemas/
+  connectors/grpc.json      # binding fragment, data not code
+tools/fakes/
 tests/
-  invariants/               # §16.5
-  guardrails/               # intentionally-invalid definitions + expected error codes
+  invariants/
+  guardrails/               # intentionally invalid definitions + expected error codes
 ```
 
-### 4.5 Dependency rule
+### 4.4 Dependency rule
 
-Every library depends on `libs/core` **and only on `libs/core`**. No library
-imports another library. Only `apps/gateway` composes implementations onto
-ports, once, at startup.
+Every library depends on `libs/core` and only on `libs/core`. No library imports
+another library. Only `apps/gateway` composes implementations onto ports, once,
+at startup. Enforced by `import-linter` in CI; a violation fails the build.
 
-**Enforced in CI** via `import-linter` (P6). A violation fails the build.
-
-### 4.6 Consequence to watch
-
-`apps/gateway` must contain protocol handling and wiring only. If business
-rules accumulate there, the boundaries have leaked — that is a review finding,
-not a style preference.
+Connector binding shapes are data in `schemas/connectors/` because both
+`libs/definition` (validation) and `libs/connectors` (execution) need them, and
+neither may import the other. Any future "one library needs another" pressure
+takes the same shape: shared data, not an import.
 
 ---
 
 ## 5. The definition model
 
-### 5.1 Four files, three domains
+### 5.1 Five files per tool
 
-The contract domain splits across two files because blast radius differs.
+| File | Contains | Blast radius | Owner |
+|---|---|---|---|
+| `prompt.yaml` | tool description, per-parameter descriptions | model behaviour | `@platform-dx` |
+| `interface.yaml` | tool name, `inputSchema`, `outputSchema`, `configSchema`, `interface_version` | consumers | `@platform-eng` |
+| `binding.yaml` | destination, connector, operation, field maps | where data goes | `@platform-eng` |
+| `governance.yaml` | resource, action, classification, idempotency, payload logging, policies | what is permitted | `@security-team` |
+| `fixtures.yaml` | declarative test cases (§15.3) | tests | `@platform-eng` |
 
-| File | Contains | Blast radius | UI-editable | Owner |
-|---|---|---|---|---|
-| `prompt.yaml` | tool description, per-param descriptions, usage hints | changes **model behavior** | **yes** | `@platform-dx` |
-| `interface.yaml` | tool name, `inputSchema`, `outputSchema`, `configSchema`, `interface_version` | **breaks consumers** | no | `@platform-eng` |
-| `binding.yaml` | destination ref, connector, operation, field map | changes **where data goes** | no | `@platform-eng` |
-| `governance.yaml` | resource, action, classification, policy refs, approval, preconditions | changes **what is permitted** | no | `@security-team` |
+### 5.2 Review routing
 
-The UI writes to exactly two file kinds: `prompt.yaml` and `surfaces/*.yaml`.
-It can never touch a destination or a permission. This is enforced by
-**filesystem path**, not by application logic.
-
-### 5.2 Edit tiers in the meta-schema
-
-Editability is a per-field annotation in the JSON Schema:
-
-```yaml
-description:
-  type: string
-  x-edit-tier: prose        # prose | composition | config | platform | security
-```
-
-One annotation, four consumers, no duplication:
-
-- the future UI renders editable fields by tier;
-- CI derives which review gate a diff must clear;
-- the security scanner knows a `prose` diff is prompt-injection surface while a
-  `platform` diff is exfiltration surface;
-- documentation generation marks operator-tunable fields.
-
-### 5.3 Review routing via CODEOWNERS
-
-Path-based, so it needs no custom tooling and cannot be bypassed by a bot:
+Path-based CODEOWNERS. No custom tooling; cannot be bypassed by a bot.
 
 ```
 definitions/**/governance.yaml   @security-team
@@ -320,7 +210,7 @@ policies/**                      @security-team
 schemas/**                       @platform-eng @security-team
 ```
 
-### 5.4 Example — read tool
+### 5.3 Read tool
 
 ```yaml
 # definitions/tools/hr/get_worker_profile/prompt.yaml
@@ -335,21 +225,22 @@ param_descriptions:
 # interface.yaml
 name: hr_get_worker_profile
 interface_version: 1
-inputSchema:                       # MODEL-facing: the agent fills these per call
+inputSchema:                       # model-facing
   type: object
   additionalProperties: false
   required: [worker_id]
   properties:
     worker_id: {type: string, pattern: "^W-[0-9]{5}$"}
-outputSchema:                      # curated approved model — never a passthrough
+outputSchema:                      # the approved model — a ceiling, never a passthrough
   type: object
-  additionalProperties: false      # REQUIRED by validation (§5.7)
+  additionalProperties: false      # required by validation
   properties:
-    worker_id:  {type: string}
-    legal_name: {type: string}
-    department: {type: string}
-    manager_id: {type: string}
-configSchema:                      # OPERATOR-facing: a human sets these once
+    worker_id:     {type: string}
+    legal_name:    {type: string}
+    department:    {type: string}
+    manager_id:    {type: string}
+    manager_chain: {type: array, items: {type: string}}
+configSchema:                      # operator-facing, set per surface
   type: object
   additionalProperties: false
   properties:
@@ -358,354 +249,252 @@ configSchema:                      # OPERATOR-facing: a human sets these once
 
 ```yaml
 # binding.yaml
-destination: hr-core               # MUST exist in definitions/destinations/ (§5.6)
+destination: hr-core               # must exist in definitions/destinations/
 connector: grpc
 operation:
-  service: hr.v1.WorkerService
+  service: hr.v1.WorkerService     # must exist in hr-core.desc
   method: GetWorker
-field_map:
+field_map:                         # inputSchema → request
   worker_id: request.worker_id
-response_map:
+config_map:                        # configSchema → request
+  include_manager_chain: request.expand_manager_chain
+response_map:                      # response → outputSchema; undeclared fields are dropped
   worker_id:  response.worker.id
   legal_name: response.worker.legal_name
   department: response.worker.org.name
   manager_id: response.worker.manager.id
+  manager_chain:
+    from: response.worker.manager_chain[].id
+    enabled_by: include_manager_chain    # dropped from output when false
 ```
 
 ```yaml
 # governance.yaml
 resource:
   type: worker
-  id_from: input.worker_id         # omit for type-scoped operations (e.g. list)
+  id_from: input.worker_id         # omit for type-scoped operations such as list
 action: read
 data_classification: pii
-intent_requirement: derived_ok     # illegal when action != read (§5.7)
 payload_logging: hashed
 policies: [hr.worker_read]
 ```
 
-### 5.5 Example — write tool
+Config can only select a subset of the declared `outputSchema`: `config_map` on
+the request side, `enabled_by` on the response side. Anything that would add a
+field is an `interface.yaml` or `governance.yaml` change.
+
+### 5.4 Write tool
 
 ```yaml
 # definitions/tools/hr/update_worker_department/governance.yaml
 resource: {type: worker, id_from: input.worker_id}
 action: write
 data_classification: pii
-intent_requirement: declared_required
-requires_human_principal: true     # never under a workload identity
+idempotent: false                  # required when action != read
 payload_logging: hashed
-policies: [hr.worker_write]        # MUST require a group (§5.8)
+policies: [hr.worker_write]        # must require a group (§5.7)
 ```
 
-Write authorization in slice one is **standing**, not per-action: the human must
-already hold the Entra group the policy requires. Per-action sign-off is the
-deferred escalation subsystem (§18), and until it exists a write the human is
-not standingly authorized for is a `deny` with declared remediation — per §11.2,
-which is the correct answer for that case anyway.
+Write authorization is **standing**: the human must already hold the Entra group
+the policy requires. A human who does not receives `deny` with a remediation.
 
-### 5.6 Egress allowlist
+### 5.5 Destinations
 
-A `binding.yaml` may reference only a destination registered here. Without this,
-a binding diff is an exfiltration path.
+A `binding.yaml` may reference only a destination registered here.
 
 ```yaml
-# definitions/destinations/hr-core.yaml          @security-team
+# definitions/destinations/hr-core.yaml                @security-team
 name: hr-core
-kind: internal
 endpoint: hr-core.internal.example.com:443
 protocols: [grpc]
+descriptor: hr-core.desc
 auth_profile:
   provider: entra_obo
   scope: api://hr-core/.default
-  attestation_enforcement: gateway_only           # §8.4
 ```
 
-Validation rejects any binding naming an unregistered destination.
+### 5.6 Derived, never authored
 
-### 5.7 Generated, never authored
+| Derived | From |
+|---|---|
+| MCP `annotations.readOnlyHint`, `annotations.destructiveHint` | `governance.action` |
+| MCP `annotations.idempotentHint` | `governance.idempotent` (`true` by construction for `read`) |
+| `definition_version` | content hash of `prompt`, `interface`, `binding`, `governance` |
+| Audit `resource`, `action`, `destination` | the declared fields |
+| Python types, docs | `schemas/` |
 
-A hand-written duplicate is a lie waiting to happen. These are derived:
-
-| Derived | From | Why |
-|---|---|---|
-| MCP tool `annotations` (`readOnlyHint`, `destructiveHint`, `idempotentHint`) | `governance.action` | The contract cannot contradict the governance layer |
-| `definition_version` | content hash of the four files | Manual version fields rot |
-| Audit `resource` / `action` / `destination` | the declared fields | Chain becomes a property of the declaration |
-| Language types, docs, UI form | `schemas/` | Single source of truth |
-
-### 5.8 Validation layers
+### 5.7 Validation
 
 1. **Structural** — JSON Schema.
-2. **Cross-layer** — real code in `libs/definition`, the strictest tests in the
-   repo:
-   - every `field_map` key exists in `inputSchema`;
-   - every `response_map` key exists in `outputSchema`;
-   - `outputSchema.additionalProperties` is `false` (approved-model rule);
-   - `intent_requirement: derived_ok` is illegal when `action != read`;
-   - when `action` is `write` or `delete` **and** `data_classification` is
-     `pii`, the tool must declare at least one `policies` entry, and static
-     analysis (§10.4) must prove every such policy requires group membership —
-     this replaces the deferred `approval` requirement;
-   - `preconditions` and `approval` are **reserved**: present in the schema so
-     enabling them later is not a breaking change, but any use is a validation
-     error until the deferred subsystems ship (§18);
+2. **Cross-layer** — code in `libs/definition`:
+   - every `field_map` key exists in `inputSchema`; every `config_map` key in `configSchema`;
+   - every `response_map` key, including `enabled_by`-gated ones, exists in `outputSchema`;
+   - every `enabled_by` names a boolean in `configSchema`;
+   - `outputSchema.additionalProperties` is `false`;
+   - `binding.connector` matches a fragment in `schemas/connectors/`, `operation` validates against it, and `service`/`method` exist in the destination's descriptor set;
+   - `idempotent` is required when `action != read` and forbidden when `action == read`;
+   - a `write` or `delete` tool with `data_classification: pii` declares at least one policy, and static analysis (§10.4) proves every such policy requires group membership;
    - `binding.destination` is registered;
-   - every tool has `fixtures.yaml`.
+   - every tool has `fixtures.yaml`;
+   - every surface `audience` entry names a registered client.
 3. **Static policy analysis** — §10.4.
 
-### 5.9 Naming and versioning
+### 5.8 Naming and versioning
 
-- MCP tool name: `{service}_{operation}`, snake_case, globally unique.
-- Definition ref in surfaces: `{service}.{operation}` (dotted).
-- `definition_version`: content hash, computed at build. Never hand-edited.
-- `interface_version`: a manual integer in `interface.yaml`. CI compares the
-  compiled `inputSchema`/`outputSchema` against the merge base and **fails if an
-  incompatible change did not bump it**. This is the only manual version burden.
+- MCP tool name: `{service}_{operation}`, snake_case, unique per server. Validation asserts the MCP name rules (1–128 chars, `[A-Za-z0-9_.-]`).
+- Surface ref: `{service}.{operation}`.
+- `definition_version`: content hash, computed at build.
+- `interface_version`: manual integer. CI diffs compiled `inputSchema`/`outputSchema` against the merge base and fails if an incompatible change did not bump it.
 
-### 5.10 Controlled vocabularies
+### 5.9 Vocabularies
 
-Every enumerated field is closed. An unrecognised value is a validation error,
-never a pass-through — otherwise a typo silently becomes a permission.
+Every enumerated field is closed. An unrecognised value is a validation error.
 
 | Field | Values | Notes |
 |---|---|---|
-| `action` | `read` \| `write` \| `delete` | Drives generated MCP annotations (§5.7) and retry policy (§14) |
-| `data_classification` | `public` \| `internal` \| `confidential` \| `pii` | Ordered by sensitivity; `pii` triggers the §5.8 group-policy rule for writes |
-| `payload_logging` | `none` \| `hashed` \| `full` | Security-owned; `hashed` is the default |
-| `intent_requirement` | `derived_ok` \| `declared_required` \| `granted_required` | `granted_required` is reserved, unusable until the `granted` tier ships (§18) |
-| `intent.attestation` | `derived` \| `declared` \| `granted` | §9.1 |
-| `attestation_enforcement` | `gateway_only` \| `destination_verified` | §8.4; `destination_verified` is **reserved** until the signing STS ships (§18) |
-| `principal_type` | `human` \| `workload` | §8.1 |
-| `auth_method` | `entra_oauth` \| `mtls` | §7 |
-| `trust_tier` | `trusted` \| `internal` \| `restricted` | `trusted`: human-present, first-party. `internal`: workload inside the enterprise boundary. `restricted`: third-party or unattested; composition analysis (§6) forbids `write` + `pii` tools on any surface whose audience includes a `restricted` client. |
-| `x-edit-tier` | `prose` \| `composition` \| `config` \| `platform` \| `security` | `composition` and `config` apply to surface fields; the others to tool fields |
-| `approval.level` | `1` \| `2` \| `3` | **Reserved** until escalation ships (§18). `1`: any peer with the resource's read permission. `2`: the resource's owning manager. `3`: a named control function (e.g. HR compliance). Higher levels do not subsume lower — `authority` names *who*, `level` records *how far up*, and both are recorded in the audit event. |
+| `action` | `read` \| `write` \| `delete` | drives `readOnlyHint`/`destructiveHint` |
+| `idempotent` | `true` \| `false` | required for `write`/`delete`; drives `idempotentHint` and retry (§11.3) |
+| `data_classification` | `public` \| `internal` \| `confidential` \| `pii` | `pii` triggers the group-policy rule for writes |
+| `payload_logging` | `none` \| `hashed` \| `full` | `hashed` = keyed HMAC (§13.4); default |
+| `trust_tier` | `trusted` \| `restricted` | `trusted`: first-party. `restricted`: third-party. No `write`+`pii` tool may sit on a surface whose audience includes a `restricted` client |
 
-### 5.11 MCP spec revision
+### 5.10 MCP revision
 
-Pin the target revision as a constant in the repo and record it in the audit
-event. Baseline: `2025-06-18`. **Verify the current revision at implementation
-time** — `outputSchema`, structured content, and `elicitation` arrived in
-specific revisions and third-party consumer support varies. Maintain
-`docs/mcp-compatibility.md` as a consumer × capability matrix; a compatibility
-gap must be a written row, not a discovered incident.
+Pinned as a constant and recorded in every audit event. Baseline `2026-07-28`.
+Consequences relied upon here:
+
+| Change in `2026-07-28` | Consequence |
+|---|---|
+| No protocol sessions; `tools/list` may vary by the authorization on the request | Authorization is per-request input. Per-principal tool filtering is spec-blessed |
+| `initialize` replaced by `server/discover`; calling it is optional for clients | `instructions` is best-effort prose, never a control |
+| `ttlMs` and `cacheScope` required on `tools/list` | A filtered list is `cacheScope: "private"`. `ttlMs` bounds how long a revoked tool stays visible |
+| SSE resumability removed; clients must re-issue a broken request with a new id | Duplicate `tools/call` is normal client behaviour (§11.3) |
+| OTel trace-context keys in `_meta` (`traceparent`, `tracestate`, `baggage`) | `trace_id` is the W3C trace id |
+| Legacy HTTP+SSE deprecated | Streamable HTTP only |
+
+Re-verify against the published spec at P7. Maintain `docs/mcp-compatibility.md`
+as a client × capability matrix.
 
 ---
 
-## 6. Surfaces and configuration
+## 6. Surfaces
 
-A **tool** is catalogue. A **surface** is a published MCP server. Configuration
-lives on the surface, so one tool definition serves many surfaces with different
-tuning — that is why they are separate files.
+A tool is catalogue. A surface is a published MCP server. Configuration lives on
+the surface, so one tool serves many surfaces.
 
 ```yaml
-# definitions/surfaces/hr-assistant.yaml       ← the "MCP"; the UI's main write target
+# definitions/surfaces/hr-assistant.yaml
 name: hr-assistant
-instructions: |                                # prose tier, model-visible
-  You are operating against internal HR data. Always confirm the worker's
-  identity by reading their profile before proposing any change.
-audience: [claude-desktop, internal-sdk]       # client `name` values from clients/registry.yaml
-tools:                                         # composition tier
+instructions: |
+  You are operating against internal HR data. Confirm the worker's identity by
+  reading their profile before proposing any change.
+audience: [claude-desktop]                     # client names from clients/registry.yaml
+tools:
   - ref: hr.get_worker_profile
-    config:                                    # config tier, validated against configSchema
+    config:                                    # validated against configSchema
       include_manager_chain: true
   - ref: hr.update_worker_department
 ```
 
-Three consequences built in deliberately:
-
-1. **Composition is a privilege change, so it is policy-gated statically.**
-   Adding a tool to a surface expands what agents can do. Cedar evaluates
-   surface composition in CI — e.g. a surface whose `audience` includes an
-   `restricted`-tier client may not include a tool with `action: write` and
-   `data_classification: pii`. A governance rule becomes a build failure.
-2. **Effective config is recorded in the audit event.** "This call ran with
-   `include_manager_chain: true`" is part of what happened.
-3. **Config narrows, never widens.** `configSchema` bounds (`maximum`, enums,
-   allowed subsets) are the guardrail. Anything that would widen scope is a
-   `governance.yaml` change, which routes to `@security-team`.
-
-**Deliberate YAGNI:** descriptions live on the tool, not per-surface.
-Per-surface prose overrides multiply the prompt-review surface by the number of
-surfaces; add when asked for, not before.
-
-Transport and routing: **Streamable HTTP only**, one route per surface at
-`/mcp/{surface}`. No stdio, no legacy SSE — all consumers are remote.
+- Composition is a privilege change. Cedar evaluates it in CI against the
+  audience's trust tiers (§5.9).
+- Effective config is recorded in the audit event.
+- Descriptions live on the tool, not per surface.
+- `instructions` rides on `server/discover`, which clients may skip. Anything that
+  must hold lives in `governance.yaml` and Cedar.
 
 ---
 
 ## 7. Client registry
 
-Entra ID does not support OAuth Dynamic Client Registration (RFC 7591), which
-the MCP spec expects. Clients are therefore pre-registered and declared in git,
-and workload identities may authenticate without OAuth.
+MCP `2026-07-28` deprecates Dynamic Client Registration in favour of Client ID
+Metadata Documents; Entra supports neither. Clients are pre-registered Entra app
+registrations, declared in git.
 
 ```yaml
-# definitions/clients/registry.yaml            @security-team
+# definitions/clients/registry.yaml                    @security-team
 clients:
-  - client_id: 1f9c...                # Entra app registration
+  - client_id: 1f9c...            # Entra app registration
     name: claude-desktop
-    auth_method: entra_oauth
-    principal_type: human             # a human is authenticated per session
     trust_tier: trusted
     surfaces: [hr-assistant]
-
-  - client_id: batch-recon-svc
-    name: reconciliation-job
-    auth_method: mtls
-    principal_type: workload          # NO human — chain starts at the agent
-    trust_tier: internal
-    surfaces: [hr-batch]
 ```
-
-Onboarding a consumer is a reviewed PR. For a system touching HR data that is a
-feature, not friction.
 
 ---
 
 ## 8. Identity
 
-Three problems, kept separate because they are constantly conflated.
+| Question | Answer |
+|---|---|
+| Who is the human? | Entra-issued OAuth token, validated on every request |
+| Which agent is acting? | Registered `client_id` in the token |
+| How do we act as the human downstream? | Entra On-Behalf-Of |
 
-| # | Question | Answer |
-|---|---|---|
-| 1 | Who is the human? | Entra-issued OAuth token at the MCP edge |
-| 2 | Which agent is acting? | Registered `client_id` (OAuth) or mTLS cert subject |
-| 3 | How do we act *as* the human at the backend? | Entra On-Behalf-Of |
+### 8.1 Subject key
 
-### 8.1 Two principal types, represented honestly
-
-```
-Principal = human(sub, tenant, via entra_oauth)      # human-present
-          | workload(client_id, via mtls)            # no human — chain starts at agent
-```
-
-The chain must state the absence of a human rather than fabricate a subject.
-`requires_human_principal: true` in `governance.yaml` makes this a declarative
-control; Cedar denies such tools to workload principals, checkable statically
-per surface.
+The audit subject key is **`(tid, oid)`**. Entra `sub` is pairwise per
+application, so the Gateway's `sub` and `hr-core`'s `sub` for the same person
+differ and cannot be joined. `oid` is stable across applications; `tid`
+disambiguates guests. `sub` is recorded as the value in the validated token.
+`upn` and `preferred_username` are mutable and never recorded.
 
 ### 8.2 At the edge
 
-The Gateway is an OAuth 2.1 **resource server**, not an authorization server:
+The Gateway is an OAuth 2.1 **resource server**: it publishes RFC 9728
+protected-resource metadata pointing at Entra, accepts only tokens whose
+audience is the Gateway, and holds no user credentials.
 
-- publishes protected-resource metadata (RFC 9728) pointing at Entra;
-- Entra issues tokens audience-restricted to the Gateway (RFC 8707 `resource`);
-- the Gateway holds no user credentials and human identity is non-forgeable.
+**Named risk — RFC 8707 versus Entra.** MCP requires clients to send
+`resource=<canonical MCP server URL>`. Entra requires `resource` to equal the app
+registration's Application ID URI and rejects a mismatch. **Decision:** set the
+Gateway app registration's Application ID URI to the Gateway's canonical HTTPS
+URL (permitted on a verified custom domain) so both values are the same string.
+This is verified by a spike against a real tenant in P5. If it fails, a thin
+authorization-server broker in front of Entra enters scope at P5.
 
-### 8.3 Intranet delegation
+### 8.3 On-Behalf-Of
 
-Entra **On-Behalf-Of**: exchange the user's token for a downstream token via
-`grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer`. The Gateway
-authenticates as a confidential client using **workload identity federation** —
-no stored secret, and every credential in the chain is short-lived.
+The Gateway exchanges the user's token for a downstream token
+(`grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer`,
+`requested_token_use=on_behalf_of`, `scope=api://hr-core/.default`). It
+authenticates as a confidential client with a **federated credential** from its
+AKS workload identity; no client secret exists. One exchange per call; no cache.
+The destination receives the human's identity and enforces its own rules.
 
-The downstream service receives the **human's** identity and enforces its own
-rules. "Can user A read compensation?" is answered by the system that owns the
-data, which is the only place it can be answered correctly (P2).
+Intent binding is Gateway-enforced only: the credential is obtained after a
+policy `allow`, and no destination verifies intent claims. The audit record says
+so.
 
-### 8.4 Intent-binding fidelity is declared, not claimed
+### 8.4 Secrets
 
-Entra will not let arbitrary intent claims be injected into its tokens, so
-binding strength differs by destination. The destination **declares** which
-applies, and the audit record carries it (P4):
-
-| `attestation_enforcement` | Meaning |
-|---|---|
-| `gateway_only` | The destination does not verify our intent claims. Binding is Gateway-enforced: the credential is resolved only after a policy `allow`, and the credential cache key includes the intent id, so it cannot cross intents. Real, but it is one component's discipline rather than a verified property. |
-| `destination_verified` | **Reserved.** The destination verifies the Gateway's signed intent token alongside the OBO token — genuine intent-bound identity enforced at the destination. Unusable until the signing STS ships (§18) *and* a downstream service agrees to validate it. |
-
-**Every destination in slice one is `gateway_only`,** including internal ones,
-because no downstream service verifies intent claims yet. Recording the weaker
-value is the point of P4: the audit trail must not imply an enforcement the
-mechanism does not deliver.
-
-### 8.5 Secrets
-
-No secrets in configuration. Workload identity federation for Entra; Key Vault
-for the intent-token signing key, with proactive rotation.
+Key Vault holds one key: the payload HMAC key. Rotation is proactive; the key
+epoch is recorded in every event.
 
 ---
 
 ## 9. Intent
 
-### 9.1 Three fidelity tiers
+Slice one has one intent tier, **`derived`**: the Gateway mints one intent id per
+call and records `attestation: derived`. There is no honest way to group calls
+from a vanilla client without agent cooperation, and inventing a grouping would
+put a fiction into the audit record.
 
-Naming here is deliberately conservative, per P4. An agent that self-reports an
-intent is *authenticated* as to which agent, but its statement is not attested
-by a human.
-
-| Tier | Source | Meaning |
-|---|---|---|
-| `derived` | Gateway infers from `(tool, args, resource)` | No stated purpose. The honest default for vanilla clients. |
-| `declared` | Agent supplies via `_meta` (SDK clients) | Agent-asserted purpose, non-repudiable only as to *which agent* said it. |
-| `granted` | **Deferred** — human pre-approves an intent grant with a TTL and an allowed tool set | The only tier where a human attested the purpose. |
-
-`granted` is specified as deferred (§18) so that `intent_requirement` does not
-need a breaking change later.
-
-### 9.2 Intent scope spans calls
-
-An intent id **must** span multiple calls, otherwise `prior_read` preconditions
-can never be satisfied.
-
-- **`declared`** — the SDK supplies a task-scoped `intent.id`, stable across the
-  calls that serve one task.
-- **`derived`** — the Gateway assigns one intent id per **MCP session**. The
-  session is the coarsest honest grouping available without agent cooperation.
-
-### 9.3 Wire format
-
-```json
-{
-  "_meta": {
-    "gateway.intent": {
-      "id": "task-8f3a2c",
-      "statement": "Reconcile department assignments for the EMEA org",
-      "parent_intent_id": null
-    }
-  }
-}
-```
-
-Absent `_meta`, the Gateway derives the intent and records
-`attestation: derived`. Nothing is forgeable, because the *agent* identity — the
-part that matters for accountability — comes from the authenticated session,
-not from `_meta`.
-
-### 9.4 Intent claims
-
-Per call, the `IntentResolver` assembles the full chain as an in-process
-`IntentClaims` value:
+Per call, dispatch assembles `IntentClaims`:
 
 ```
-principal      sub, principal_type (human | workload)
+principal      oid, tid, sub
 agent          client_id, trust_tier
-intent         {id, attestation}
+intent         {id, attestation: derived}
 tool           {name, definition_version}
 resource       {type, id}
 action         read | write | delete
 destination    service name
-trace_id       correlates to audit + OTel
+trace_id
 ```
 
-`IntentClaims` has two consumers in slice one:
-
-1. **The PDP** — it is the `context` of the Cedar decision (§10.2).
-2. **The audit event** — recorded verbatim, which is what makes the chain
-   complete by construction (P1).
-
-Plus one enforcement role: **the credential cache key includes `intent.id`**, so
-a credential resolved under one intent can never be reused under another
-(invariant I5). That is the whole of intent-binding in slice one, and it is
-real — it just isn't cryptographic.
-
-**Deliberately not built:** signing these claims into a JWT with a Key Vault
-key, rotation, and a JWKS endpoint. Nothing in slice one would verify that
-signature, because `destination_verified` requires changing the downstream
-services to validate it — which is out of scope. Signing infrastructure with
-zero verifiers is cost without a guarantee. See §18 for the trigger, and P4:
-the audit record says `gateway_only`, which is the truth.
+`IntentClaims` is the Cedar `context` and is recorded verbatim in the audit
+event. Declared intent via `_meta`, granted intent, and signed intent tokens
+arrive with the Enterprise SDK and a destination that verifies them (§17.2).
 
 ---
 
@@ -713,668 +502,477 @@ the audit record says `gateway_only`, which is the truth.
 
 ### 10.1 Engine
 
-Cedar, embedded in-process behind the `PolicyDecisionPoint` port. Chosen for
-three reasons: its principal/action/resource/context model maps almost 1:1 onto
-the chain; it is deliberately not Turing-complete, so properties can be proven
-over the whole policy set; and it needs no network hop, which removes the PDP
-from the runtime failure surface (§15).
+Cedar, embedded in-process behind `PolicyDecisionPoint`. Its
+principal/action/resource/context model maps onto the chain, it is not
+Turing-complete so properties can be proven over the whole set, and it removes
+the PDP from the runtime failure surface.
 
 ### 10.2 Mapping
 
 ```
-principal  ← Principal (human or workload), with Entra groups as Cedar groups
-action     ← governance.action                (read | write | delete)
+principal  ← Principal, with Entra groups as Cedar groups
+action     ← governance.action
 resource   ← governance.resource.type + id_from
-context    ← {agent: {client_id, trust_tier}, intent: {id, attestation},
-              destination: {service, attestation_enforcement},
-              data_classification, surface, config, principal_type,
-              requires_human_principal}
+context    ← {agent: {client_id, trust_tier}, destination: {service},
+              data_classification, surface, config}
 ```
 
-### 10.3 Illustrative policies
+Two decision shapes. The call-time decision has a concrete resource. The
+`tools/list` visibility decision has no arguments, so it is type-scoped:
+
+```
+action     ← Action::"list"
+resource   ← ResourceType::"worker"
+context    ← as above, minus argument-derived fields
+```
+
+A `permit` on `Action::"list"` is a statement about a class of resources.
+
+### 10.3 Policies
 
 ```cedar
 permit (
   principal in Group::"HR-Core-Readers",
   action == Action::"read",
   resource is Worker
-) when {
-  context.agent.trust_tier == "trusted"
-};
+) when { context.agent.trust_tier == "trusted" };
 
-// P3: uncertainty resolves to deny, so this forbid is belt-and-braces, not the mechanism
-forbid (principal, action, resource)
-when {
-  context.principal_type == "workload" && context.requires_human_principal
-};
-
-// mirrors the asserted property in §10.4
-forbid (principal, action, resource)
-when {
-  context.data_classification == "pii" &&
-  (action == Action::"write" || action == Action::"delete") &&
-  context.intent.attestation == "derived"
-};
+permit (
+  principal in Group::"HR-Core-Writers",
+  action == Action::"write",
+  resource is Worker
+) when { context.agent.trust_tier == "trusted" };
 ```
 
 ### 10.4 Static analysis in CI
 
-A governance artifact, not merely a test. CI runs Cedar validation against the
-schema, then asserts named properties over the whole policy set, e.g.:
+Cedar validation against the schema, then named properties over the policy set:
 
-- nothing permits `write` to `pii` under `attestation: derived`;
-- nothing permits any action to a `workload` principal on a tool declaring
-  `requires_human_principal`;
-- every surface's composition satisfies its `audience` trust-tier constraints.
+- every policy permitting `write` or `delete` on a `pii` tool requires group membership;
+- no surface whose audience includes a `restricted` client contains a `write`+`pii` tool.
 
-Output is a report committed as a CI artifact — the thing you hand an auditor.
+The report is a committed CI artifact.
 
-### 10.5 Entity data
+### 10.5 Groups come from the token
 
-Group memberships come from Entra at runtime. Cached with a TTL **and a hard
-max-staleness**; past max-staleness the Gateway fails closed (§15). This — not
-the engine — is the real runtime policy risk.
+The app registration sets `groupMembershipClaims: ApplicationGroup`, so the
+access token carries only groups assigned to the application. There is no Graph
+call and no cache; staleness is bounded by token lifetime, and `token_iat` is
+recorded per call.
+
+If a principal exceeds the claim limit Entra omits `groups` and emits
+`_claim_names`. The Gateway **denies** with `groups_overage_unsupported` and a
+remediation. The Graph fallback is deferred.
 
 ---
 
-## 11. Decisions, preconditions, escalation
+## 11. Decisions and errors
 
 ### 11.1 Outcomes
 
 ```
-Decision = allow
-         | deny(reason, remediation)
-         | escalate(authority, level)   # RESERVED — see §18
+Decision = allow | deny(reason, remediation)
 ```
 
-Slice one implements `allow` and `deny` only. `escalate` is reserved in the type
-so adding it later is not a breaking change to the audit format or the PDP port.
+| Situation | Response |
+|---|---|
+| Agent missing an argument | structured error naming what is missing |
+| Human lacks the permission | `deny` + remediation, e.g. "request group HR-Core-Writers" |
+| Action needs a second authority | not in slice one; the tool is not published |
 
-No obligations in slice one either. Field-level redaction belongs with
-field-level authorization (§18), and a half-built obligation mechanism is worse
-than none.
+### 11.2 A deny is a tool result
 
-### 11.2 What is *not* a human-in-the-loop event (P3)
-
-| Situation | Wrong | Right |
-|---|---|---|
-| Agent missing an argument | prompt a human | **Structured error** naming what is missing — the agent resolves it |
-| Human genuinely lacks the permission | approval prompt | **Deny** + declared remediation ("request role `comp_admin`") |
-| Action requires a *second* authority by design | — | **Declared escalation** — the only real HITL (deferred, §18) |
-
-**Uncertainty resolves to deny, never to a human.** An undecidable case is a gap
-in the policy set: a bug to fix in git, and the denial is auditable evidence of
-the gap.
-
-### 11.3 Structured errors and remediation
-
-The one part of P3 that slice one *does* implement: a refusal always tells the
-agent or the human precisely what to do, so nothing degrades into an interrupt.
+MCP classifies policy and validation failures as *tool execution errors*, which
+clients should give to the model; JSON-RPC errors are for malformed requests.
+Every deny is therefore a `CallToolResult` with `isError: true`:
 
 ```json
 {
-  "error": "policy_denied",
-  "reason": "principal not in group HR-Core-Writers",
-  "remediation": {"request_role": "HR-Core-Writers", "via": "https://access.example.com/..."},
-  "trace_id": "..."
+  "resultType": "complete",
+  "isError": true,
+  "content": [{"type": "text",
+    "text": "Denied: principal not in group HR-Core-Writers. Request the group at https://access.example.com/... (trace 4c1b9e2)"}],
+  "structuredContent": {
+    "error": "policy_denied",
+    "reason": "principal not in group HR-Core-Writers",
+    "remediation": {"request_group": "HR-Core-Writers", "via": "https://access.example.com/..."},
+    "trace_id": "4c1b9e2..."
+  }
 }
 ```
 
-Validation failures use the same envelope with an argument-level `remediation`
-the agent can act on immediately.
+| Failure | Wire form |
+|---|---|
+| Policy deny, validation failure, backend business error | `CallToolResult`, `isError: true` |
+| Missing or invalid token | HTTP 401/403 with `WWW-Authenticate` |
+| Unknown tool, malformed request | JSON-RPC error |
+| `governance_unavailable` (§14.2) | JSON-RPC error |
 
-### 11.4 Deferred: preconditions and escalation
+### 11.3 Error classes, retries, duplicates
 
-Both are specified in §18 with triggers, and their fields are reserved in the
-schema (§5.8). Recording the reasoning, since it is easy to lose:
+| Class | Behaviour |
+|---|---|
+| Validation | `isError`, remediation names the argument |
+| Policy deny | `isError`, remediation names the group |
+| OBO failure | one silent retry, then `isError` |
+| Backend 5xx / timeout | `read` and `idempotent: true` retry once; otherwise surfaced as-is |
+| Governance infrastructure | JSON-RPC error (§14) |
 
-**`prior_read` preconditions** would let the Gateway verify *"did this intent
-already read the worker it is about to modify?"* — turning the audit spine into
-an authorization input that blocks blind writes. Attractive, and deferred
-because it needs a **queryable index over audit records in the request path**.
-Neither the WAL nor an Event Hubs stream can answer that query; that index is a
-subsystem with its own availability and consistency story, not a governance
-field.
+Clients replay `tools/call` after a broken stream, including mutating ones. The
+Gateway computes `dedup_key = HMAC(tid, oid, client_id, tool, args_hmac)` and
+records it. For `idempotent: false` tools, a repeat within **60 seconds** on the
+same pod is refused with an `isError` naming the original `trace_id`. The window
+is per pod and in memory; a replay that lands on another pod is not blocked, but
+the recorded `dedup_key` makes it detectable after the fact.
 
-**Escalation** requires an approval store, an out-of-band notification path,
-args-hash pinning, TTL handling, and re-call resumption. Note also that MCP's
-`elicitation` capability is **the wrong mechanism** for it — the connected human
-is not the higher authority, so escalating to a manager cannot route through the
-agent's own session. Until it exists, a human who lacks authorization gets
-`deny` with declared remediation (§11.2), which is the correct answer for the
-common case regardless.
+If the backend wrote but the audit `close` failed, that is a distinct alarmed
+state and the agent is not told "done". Every error carries `trace_id`.
 
 ---
 
 ## 12. Request lifecycle
 
-Every step names the port it passes through, which is how the boundaries get
-verified.
-
 ```
-consumer                 GATEWAY (apps/gateway = wiring only)                backend
+consumer                 GATEWAY                                              backend
    │
-   │ 1. connect ──────►  OAuth 2.1 / mTLS: validate credential
-   │                     PrincipalResolver  → Principal (human | workload)
+   │ 1. EVERY request ►  validate OAuth token; PrincipalResolver → Principal
    │                     clients/registry.yaml → AgentIdentity + trust_tier
    │
-   │ 2. initialize ───►  DefinitionSource → surface (route /mcp/{surface})
-   │  ◄───────────────── serverInfo + surface.instructions
+   │ 2. server/discover  surface for /mcp/{surface} → capabilities + instructions
    │
-   │ 3. tools/list ───►  surface tools ─filter─► PDP (visibility)
-   │  ◄───────────────── tools + GENERATED annotations
+   │ 3. tools/list ───►  filter surface tools through PDP (Action::"list")
+   │  ◄───────────────── tools + generated annotations + ttlMs + cacheScope: private
    │
-   │ 4. tools/call ───►  name, args, _meta.intent?
-   │                       │
+   │ 4. tools/call ───►  name, args
    │                     5. resolve declaration + effective config
-   │                     6. IntentResolver → IntentClaims (derived | declared)
-   │                     7. PDP (Cedar) → allow | deny
-   │                     8. AuditSink.open()   ◄── durable, BEFORE any side effect
-   │                     9. CredentialProvider.resolve(claims) → entra_obo
-   │                          cache key includes intent.id  → invariant I5
+   │                     6. mint intent id; assemble IntentClaims
+   │                     7. PDP → allow | deny
+   │                     8. AuditSink.open() — fsync BEFORE any side effect
+   │                     9. CredentialProvider → OBO token
    │                    10. Connector.execute()  ────────────────────────► call
-   │                    11. response_map → outputSchema (drop undeclared)  ◄─── resp
-   │                    12. AuditSink.close(outcome)
+   │                    11. response_map → outputSchema; AuditSink.close()  ◄─ resp
    │  ◄───────────────── result
 ```
 
-Four properties that are deliberate choices, not implementation details:
-
-**Step 3 filters, it does not merely deny.** An unauthorized tool is *absent*
-from `tools/list`. Beyond defence in depth: every tool shown costs context and
-invites the model to try it. Filtering keeps the prompt surface minimal, which
-is a quality argument as much as a security one.
-
-**Step 8 always precedes step 10.** The audit record opens durably before any
-side effect can occur. This ordering is what makes invariant I1 mechanically
-testable rather than aspirational. Denials are audited too — a blocked call is
-often the more interesting record.
-
-**Step 9 is the intent-binding seam.** The credential is resolved only after a
-policy `allow`, under a cache key that includes `intent.id`. That is what
-`gateway_only` enforcement means concretely (§8.4): binding by the Gateway's own
-discipline, honestly recorded as such.
-
-**Steps 5–12 live in `libs/dispatch`, not in the app.** If they cannot be moved
-there, §4.5 has been violated.
+- Step 3 filters rather than denies; an unauthorized tool is absent. It is sound
+  in one direction only: a listed tool may still be denied at step 7.
+- Step 8 precedes step 10 unconditionally. Denies are audited too.
+- Steps 5–11 live in `libs/dispatch`.
 
 ---
 
 ## 13. Traceability
 
-Two sinks, because sampling is correct for one purpose and fatal for the other.
-
 | | OTel traces | Audit log |
 |---|---|---|
-| Purpose | latency, debugging | governance, "who did what to whose data, on whose behalf, why" |
-| Sampling | yes | **never** |
-| Retention | short | long, immutable |
-| Store | Azure Monitor | Event Hubs → blob with legal hold |
+| Purpose | latency, debugging | who did what to whose data, on whose behalf |
+| Sampling | yes | never |
+| Store | Azure Monitor | WAL → immutable blob (record) + Log Analytics (index) |
 | Correlation | `trace_id` | `trace_id` |
 
-Conflating them means the one call you get asked about is the one that was
-sampled away.
+The Gateway continues an incoming `traceparent` from `_meta` or starts a trace.
 
-### 13.1 Audit event
+### 13.1 The WAL
 
-Every field comes from a declaration, which is what makes the chain complete by
-construction (P1).
+An append-only file on a **per-pod PersistentVolume**. At step 8 the `open`
+record is appended and fsynced before step 10; a durable local write is what
+lets the call proceed. A drain worker ships batches to immutable blob and Log
+Analytics and truncates on acknowledgement.
+
+The Gateway runs as a StatefulSet. A `preStop` hook drains the WAL, with
+`terminationGracePeriodSeconds` above the observed p99 drain time. A clean
+shutdown writes `phase: epoch_close`, so a truncated tail is distinguishable
+from a finished epoch. A PVC whose pod never returns is an operator
+orphan-drain task; `just explain` can read a mounted WAL directly.
+
+### 13.2 Audit event
 
 ```yaml
-record:      {id, seq, writer_id}      # writer_id = gateway instance-epoch
-trace_id:    ...
-phase:       open | close
-principal:   {type: human|workload, sub, tenant, auth_method}      # ← human
-agent:       {client_id, name, trust_tier}                         # ← agent
-intent:      {id, attestation: derived|declared, statement?}       # ← intent
-surface:     {name, version}
-tool:        {name, definition_version, interface_version, git_sha}# ← tool
-config:      {include_manager_chain: true}                         # effective config
-resource:    {type: worker, id: "W-10423"}                         # ← resource
-action:      read | write | delete                                 # ← action
-destination: {service, auth_profile, endpoint,
-              attestation_enforcement}                             # ← destination
+record:      {id, seq, writer_id, schema: 1}      # writer_id = gateway instance epoch
+phase:       open | close | epoch_close
+trace_id:    ...                                  # W3C trace id
+principal:   {oid, tid, sub, token_iat}           # key is (tid, oid)
+agent:       {client_id, name, trust_tier}
+intent:      {id, attestation: derived}
+surface:     {name}
+tool:        {name, definition_version, interface_version, git_sha, idempotent}
+call:        {mcp_request_id, dedup_key}
+config:      {...}                                # effective config
+resource:    {type, id}
+action:      read | write | delete
+destination: {service, endpoint}
 decision:    {outcome, determining_policies, reason}
-payloads:    {args_hash, result_hash}       # per governance.payload_logging
+payloads:    {args_hmac, result_hmac, hmac_key_epoch}
 mcp:         {spec_revision}
-outcome:     {status, backend_status, latency_ms, error_class}      # close only
+outcome:     {status, backend_status, latency_ms, error_class}   # close only
 clock:       {opened_at, closed_at}
 ```
 
-### 13.2 Three points that matter more than they look
+### 13.3 Store
 
-**`git_sha` + `definition_version` in every record.** Combined with definitions
-baked into the image (D10), *"what exactly was this tool configured to do at
-14:32 last Tuesday"* has one unambiguous answer. This is traceability of the
-**declaration**, not just of the call.
+Events land in Azure immutable blob under a **locked time-based retention
+policy** equal to the audit retention period. Legal hold is not the retention
+mechanism; it is applied on top when litigation requires. A locked policy can be
+extended but never shortened, so the retention number is set with the retention
+owner.
 
-**Tamper-resistance comes from the store, not from the record.** Audit events
-land in Azure immutable blob storage with legal hold — WORM, enforced by the
-platform and outside the Gateway's own trust boundary, which is exactly where
-such a guarantee has to live. `writer_id` plus a monotonic `seq` per
-instance-epoch gives gap detection: a missing sequence number is visible without
-any cryptographic construction.
+`writer_id` plus monotonic `seq` gives gap detection; `epoch_close` distinguishes
+truncation from a clean end. Application hash chains are not built: an attacker
+who can rewrite records on a pod also controls the chain computation.
 
-Application-level hash chaining is deliberately **not** built (§18). An attacker
-who can rewrite audit records on a pod also controls the chain computation on
-that pod, so a self-computed chain defends against a threat it cannot actually
-stop, while adding chain epochs, head anchoring, and crash reconciliation of
-buffered records. The cost is real and the guarantee is not.
+### 13.4 Payload fingerprints
 
-**Payload logging is governed, not configured.** `payload_logging:
-none|hashed|full` lives in `governance.yaml` (security-owned), never on a
-surface. `hashed` is the useful default: it proves *what* was sent without
-retaining PII, so two calls can be compared for equality — and later matched
-against an approval ticket (§18) — without the data ever being stored.
+`hashed` means **HMAC-SHA256 under the Key Vault key**. `worker_id` has 10⁵
+possible values; a bare digest is a reversible encoding of PII that WORM storage
+could never withdraw. Equality holds within a key epoch, so `hmac_key_epoch` is
+recorded.
 
----
+### 13.5 `just explain`
 
-## 14. Error handling
+```
+$ just explain <trace_id>
+principal:   human(oid 4f1c-…, tid 9a2b-…)          agent: claude-desktop (trusted)
+intent:      i-8f3a  attestation: derived            surface: hr-assistant
+tool:        hr_get_worker_profile @ git 4c1b9e2      def_version: 9a2f1c
+resource:    worker/W-10423                           destination: hr-core
+decision:    DENY   determining policy: hr.worker_read:12
+             reason: principal not in group HR-Core-Readers
+             groups: from token, issued 45s ago
+remediation: request group HR-Core-Readers
+source:      log-analytics (blob: audit/2026/09/04/w-17-0003.jsonl#412)
+```
 
-Errors are classed by who can act on them, because that determines the shape of
-the response.
-
-| Class | Response | Who fixes it |
-|---|---|---|
-| Validation | structured error + `remediation` | the **agent**, immediately |
-| Policy deny | `deny` + reason + remediation | the **human**, out of band |
-| Credential failure (OBO expired) | retriable; one silent refresh, then surface | the **gateway** |
-| Backend 5xx / timeout | mapped error; no retry on non-idempotent | **nobody** — report honestly |
-| Governance-infra failure | §15 | operator |
-
-Retry policy is read from a declaration, never guessed: `action: read` is
-retriable; `write`/`delete` retry only when `idempotencyHint` is declared. Never
-infer idempotency.
-
-**Never return a partial success as a success.** If the backend wrote but the
-audit `close` failed, that is a distinct, alarmed state. The agent must not be
-told "done."
-
-Every error returned to an agent carries `trace_id`.
+Reads the Log Analytics index and cites the blob. Falls back to the local WAL
+for a trace not yet drained and says so. When index and blob disagree, the blob
+wins and the discrepancy is reported.
 
 ---
 
-## 15. Degradation
+## 14. Degradation
 
-### 15.0 The audit WAL
+### 14.1 Failure modes
 
-**WAL — write-ahead log.** A local append-only file on the pod's disk. At §12
-step 8 the Gateway appends the audit `open` record and **fsyncs** it before step
-10 issues the backend call; only a durable local write lets the call proceed. An
-async drain worker ships records to Event Hubs → immutable blob storage and
-truncates them on acknowledgement.
-
-"Write-ahead" names the ordering guarantee: the record of an action is durable
-*before* the action occurs, so an unrecorded action is structurally impossible
-rather than merely unlikely. This is what makes invariant I1 hold.
-
-Its purpose is to decouple *"the audit record is durable"* from *"the audit
-record reached the remote store."* Without it the only options are to block every
-call on a remote write — coupling Gateway availability to Event Hubs — or to
-proceed unlogged, which creates the untraceable window this system exists to
-prevent.
-
-Its cost is that a sink outage moves audit durability onto a single pod's disk
-(§15.2, `wal_oldest_unshipped_age_s`).
-
-### 15.1 Failure modes
-
-The governance components fail differently, so one policy does not fit.
-
-| Component | How it fails | Design |
+| Component | Failure | Design |
 |---|---|---|
-| **Audit sink** | Event Hubs unreachable | Local **append-only WAL** on the pod; async drain to the queue. A sink outage is not a traffic outage. |
-| **Audit WAL** | disk unwritable | Pod goes **unready** and stops serving. No unlogged action. |
-| **Cedar policy set** | invalid or unloadable | A **deploy-time** failure: policies compile and validate in CI, and again at boot. A pod that cannot load its policy set never becomes ready. |
-| **Cedar entity data** | Entra group lookup stale | TTL **and** hard max-staleness. Past max-staleness → fail closed, loudly. The real runtime risk. |
-| **Entra token endpoint** | OBO exchange unavailable | Not a governance failure: an upstream dependency error, surfaced honestly with `trace_id`. No fallback credential exists by design. |
+| Blob or Log Analytics | unreachable | WAL absorbs; drain retries; traffic continues. Drain lag past a threshold alarms, then applies backpressure |
+| WAL | disk unwritable | pod unready; no unlogged action |
+| WAL | pod evicted with unshipped records | PVC survives; `preStop` drain; orphan drain by operator |
+| Cedar policy set | invalid | deploy-time failure; pod never becomes ready |
+| Groups overage | `groups` claim omitted | deny with `groups_overage_unsupported` |
+| Entra token endpoint | OBO unavailable | upstream error surfaced with `trace_id`; no fallback credential |
 
-Slice one has **two** stateful runtime components — the WAL and the Cedar entity
-cache — and no database. That is a deliberate consequence of the §18 deferrals.
+### 14.2 Fail loudly
 
-Embedding the PDP (D6) is what moves the largest failure mode from runtime to
-deploy time.
-
-### 15.2 Fail loudly, concretely
-
-Readiness reflects **governance capability**, not process liveness. A
-`GovernanceHealth` object with named components drives `/readyz` *and* appears in
-the error body, so a failure names itself instead of surfacing as a generic 503:
+`GovernanceHealth` drives `/readyz` and appears in the error body:
 
 ```json
 {
   "error": "governance_unavailable",
   "governance_health": {
     "wal_writable": true,
+    "wal_volume_durable": true,
     "policy_loaded": true,
-    "entity_cache_fresh": false,
-    "entity_cache_age_s": 812,
-    "entity_cache_max_staleness_s": 600,
-    "wal_oldest_unshipped_age_s": 3
+    "wal_oldest_unshipped_age_s": 3,
+    "audit_index_lag_s": 4
   },
   "trace_id": "..."
 }
 ```
 
-Drain lag past a threshold alarms, then applies backpressure. Silent buffering
-without an alarm is the failure mode to design against.
-
-### 15.3 Easy to fix — `just explain`
-
-One debuggability feature earns its place in slice one. "Why was I denied?"
-answered authoritatively from the audit record plus Cedar's determining policies:
-
-```
-$ just explain <trace_id>
-principal:   human(alice@…) via entra_oauth      agent: claude-desktop (tier: trusted)
-intent:      i-8f3a  attestation: derived        surface: hr-assistant
-tool:        hr_get_worker_profile @ git 4c1b9e2  def_version: 9a2f1c
-resource:    worker/W-10423                      destination: hr-core (gateway_only)
-decision:    DENY
-  determining policy: hr.worker_read:12
-  reason: principal not in group HR-Core-Readers
-  entity data age: 45s
-remediation: request role comp_admin
-```
-
-Available as both a CLI and an operator endpoint. Cheap to build; pays back
-constantly.
+`wal_volume_durable` asserts the WAL is on a PersistentVolume, so a misapplied
+manifest fails readiness. `audit_index_lag_s` is reported but never gates
+readiness.
 
 ---
 
-## 16. Testing
+## 15. Testing
 
-Five layers. The property that matters: **adding a tool means adding data, not
-writing tests.**
+### 15.1 Unit
 
-### 16.1 Unit
+Pure libraries only: cross-layer rules, Cedar decision tables, `seq` gap and
+epoch accounting, field mapping, claims assembly, HMAC and key epoch,
+`dedup_key`.
 
-Pure libraries only, no I/O: cross-layer validation rules, Cedar decision
-tables, audit `seq` gap detection, connector field mapping, intent-claim
-assembly, credential cache-key derivation.
+### 15.2 Definition conformance
 
-### 16.2 Definition conformance
+CI enumerates `definitions/tools/`. Every tool validates, passes every
+cross-layer rule, and has `fixtures.yaml`.
 
-CI enumerates `definitions/tools/`. Every tool must validate structurally, pass
-every cross-layer rule (§5.8), and **have `fixtures.yaml`**. A tool without
-fixtures fails the build.
-
-### 16.3 Fixture runner
-
-One runner, N data files:
+### 15.3 Fixture runner
 
 ```yaml
 # definitions/tools/hr/get_worker_profile/fixtures.yaml
 cases:
   - name: happy path
-    principal: {type: human, sub: alice, groups: [HR-Core-Readers]}
+    principal: {oid: "4f1c-…", tid: "9a2b-…", groups: [HR-Core-Readers]}
     config: {include_manager_chain: false}
     args: {worker_id: "W-10423"}
     expect_backend_request:
       service: hr.v1.WorkerService
       method: GetWorker
-      body: {request: {worker_id: "W-10423"}}
+      body: {request: {worker_id: "W-10423", expand_manager_chain: false}}
     backend_response:
       response: {worker: {id: "W-10423", legal_name: "Bob Roe",
                           org: {name: "Finance"}, manager: {id: "W-10001"},
+                          manager_chain: [{id: "W-10001"}, {id: "W-10000"}],
                           salary: 120000}}
     expect_output:
       worker_id: "W-10423"
       legal_name: "Bob Roe"
       department: "Finance"
       manager_id: "W-10001"
-      # `salary` is absent: undeclared fields are dropped (§5.7)
+      # salary absent: undeclared. manager_chain absent: config off.
     expect_decision: allow
     expect_audit:
       action: read
       resource: {type: worker, id: "W-10423"}
-      payloads: {args_hash: "*", result_hash: "*"}
+
+  - name: config selects the declared field
+    principal: {oid: "4f1c-…", tid: "9a2b-…", groups: [HR-Core-Readers]}
+    config: {include_manager_chain: true}
+    args: {worker_id: "W-10423"}
+    expect_output:
+      manager_chain: ["W-10001", "W-10000"]
 
   - name: denied without group
-    principal: {type: human, sub: carol, groups: []}
+    principal: {oid: "7b3e-…", tid: "9a2b-…", groups: []}
     args: {worker_id: "W-10423"}
     expect_decision: deny
     expect_no_backend_call: true
+    expect_error: {isError: true, remediation: "*"}
 ```
 
-The `salary` case is the approved-model rule under test: a backend adding a
-sensitive field never silently reaches a prompt.
-
-### 16.4 Policy static analysis
-
-§10.4, run in CI, output committed as an artifact.
-
-### 16.5 E2E invariants
+### 15.4 Invariants (E2E)
 
 Real Gateway, fake OIDC provider, reference backend, real MCP client from the
-SDK. These invariants **are** the governance guarantee, so they are a named
-suite rather than incidental assertions:
+SDK.
 
 ```
-I1  No backend request occurs without a preceding durable (fsynced) audit `open` carrying an `allow`
-I2  Every completed call has a matched open/close pair, and `seq` per `writer_id` has no gaps
-I3  No tool appears in tools/list that the PDP would deny for that principal
-I4  MCP annotations always match governance.action (no contract/governance drift)
-I5  A credential resolved under one intent.id is never reused under another
-I6  requires_human_principal tools never execute under a workload principal
-I7  Payloads are never persisted at higher fidelity than payload_logging declares
-I8  A definition whose destination is unregistered is never loadable
-I9  Every deny returned to a consumer carries a reason, a remediation, and a trace_id
+I1  No backend request occurs without a preceding fsynced audit open carrying an allow
+I2  Every call has a matched open/close; seq per writer_id has no gaps; every ended
+    epoch has an epoch_close marker
+I3  No tool appears in tools/list that the type-scoped decision denies; every
+    tools/list result is cacheScope: private
+I4  Annotations match governance: readOnlyHint/destructiveHint from action,
+    idempotentHint from idempotent
+I5  Payloads are never persisted above the declared payload_logging fidelity
+I6  A definition whose destination is unregistered is never loadable
+I7  Every deny is a CallToolResult with isError: true carrying reason, remediation, trace_id
+I8  A replayed non-idempotent call within the window on the same pod does not execute twice
 ```
 
-I9 is a governance invariant, not a UX nicety: a system that fails closed
-without saying why is one people route around (P5).
+### 15.5 Guardrails
 
-### 16.6 Guardrail tests
-
-`tests/guardrails/` holds **intentionally invalid** definitions with expected
-error codes. Test that the gate blocks, not merely that valid input passes. A
-validator nobody has seen fail is a validator not known to work.
+`tests/guardrails/` holds intentionally invalid definitions with expected error
+codes. A validator nobody has seen fail is not known to work.
 
 ---
 
-## 17. CI/CD and the governance pipeline
-
-### 17.1 Pipeline
+## 16. CI pipeline
 
 ```
 PR opened
   ├─ structural validation (JSON Schema)
-  ├─ cross-layer validation (§5.8)
-  ├─ interface_version bump check (§5.9)
-  ├─ prose lint (length, injection markers, no contradiction of governance)
-  ├─ ScanProvider port  ← future security scan API plugs in here; report → PR comment
-  ├─ Cedar validate + static property assertions (§10.4) → report artifact
-  ├─ surface composition analysis vs audience trust tiers
+  ├─ cross-layer validation (§5.7)
+  ├─ interface_version bump check
+  ├─ prose lint on prompt.yaml and surface instructions (length, injection markers)
+  ├─ Cedar validate + static properties (§10.4) → report artifact
   ├─ unit + conformance + fixtures + guardrails + E2E invariants
-  ├─ import-linter (architecture, §4.5)
-  └─ CODEOWNERS review routing by path (§5.3)
+  ├─ import-linter (§4.4)
+  └─ CODEOWNERS routing by path
 
-merge → build image (definitions baked in) → rolling deploy
+merge → build image (definitions + descriptors baked in) → rolling deploy
 ```
 
-The `ScanProvider` port exists in slice one with a no-op-plus-lint
-implementation, so the future security scan API is a configuration change rather
-than a refactor. Its report attaches to the PR, per the intended governance flow.
-
-### 17.2 Distribution
-
-Definitions are baked into the image, so the running image digest maps to
-exactly one git SHA — no runtime config fetching to secure or operate, and no
-ambiguity about what was live when a call happened.
-
-The loader sits behind the `DefinitionSource` port with
-`notifications/tools/list_changed` wired up from day one, so moving to signed
-bundles later is a configuration change, not a refactor.
-
-### 17.3 Go extraction trigger (D7)
-
-Python is the known ceiling for holding many concurrent long-lived MCP
-connections. The extraction of `libs/dispatch` + `apps/gateway` to Go is
-triggered when **any** of these holds for a sustained 7 days at production load:
-
-- more than **1,500 concurrent MCP sessions per pod**, or
-- **Gateway-attributable p99 overhead above 75 ms** (total p99 minus backend p99), or
-- **CPU above 60%** at 50% of peak traffic.
-
-Until a trigger fires, this is explicitly not work. The port boundaries (§4.5)
-are what keep it a rewrite of two packages rather than of the system.
+Definitions ship in the image, so the image digest maps to one git SHA. A
+definition change is a deploy.
 
 ---
 
-## 18. Deferred subsystems
+## 17. Scope
 
-Each gets its own spec and plan cycle. Triggers are written so deferral cannot
-become indefinite by default.
+### 17.1 In scope
 
-| Subsystem | Trigger | Notes |
-|---|---|---|
-| **Escalation / approval tickets** | First tool that genuinely requires per-action second-authority sign-off | `Decision.escalate` and `governance.approval` are already reserved (§5.8, §11.1). Adds an approval store, out-of-band notification, args-hash pinning, TTL, and re-call resumption. Until then, standing Entra group authorization plus `deny` + remediation (§11.2). |
-| **`prior_read` preconditions** | Together with the audit query index they require | Needs a queryable, indexed view of audit records in the request path — neither the WAL nor an Event Hubs stream can answer "did this intent read this resource". Field reserved in the schema. |
-| **Intent-token signing STS (`destination_verified`)** | **When the first downstream service commits to verifying it** | Claims already assembled and audited (§9.4); this adds ES256 signing, a Key Vault key with rotation, a JWKS endpoint, and TTL/skew handling. Worthless until a verifier exists — build it *with* that service, not before. |
-| **Hash-chained audit records** | An auditor requiring tamper-evidence beyond WORM, or audit records leaving Azure immutable storage | Immutable blob with legal hold already provides WORM outside the Gateway's trust boundary. Self-computed chains do not defend against an attacker who controls the pod. |
-| **Field-level authorization + derived data models** | **Before any external-SaaS destination** | The prerequisite for D2. Adds output-field classification, obligations, redaction. `outputSchema.additionalProperties: false` is the hook it attaches to. |
-| **External SaaS (Workday) destinations** | After field-level authz ships | Requires per-user OAuth consent, refresh-token lifecycle in Key Vault, and accepting `attestation_enforcement: gateway_only`. A service-account approach is rejected: it breaks the chain at the destination and makes the Gateway a confused deputy. |
-| **Orchestrator** | After ≥5 hand-authored tools exist | Contract: consumes proto/OpenAPI, emits the four definition files **plus fixtures** as a **pull request**. Never writes to main. Its output is always a proposal; the §17.1 pipeline is the gate. |
-| **Behavioral eval gate** | **Before non-engineers get UI write access** | Tool-selection eval over a maintained utterance corpus; blocks prose/composition/config diffs on regression. Cannot be built meaningfully before there are tools worth evaluating. |
-| **Enterprise SDK** | After the first external consumer request | Supplies `declared` intents via `_meta`, handles escalation tickets and precondition remediation loops. Depends on `libs/core` types only. |
-| **Configuration UI** | After the behavioral eval gate | Writes `prompt.yaml` and `surfaces/*.yaml` only, as PRs. Forms generated from `schemas/` via `x-edit-tier`. |
-| **`granted` intent tier** | With the UI | Human pre-approves an intent grant (TTL + allowed tool set). The only tier where a human attests purpose. `intent_requirement` already reserves the value. |
-| **DCR broker AS** | First consumer that cannot pre-register | Highest-blast-radius component in the design; do not build speculatively. |
-| **Signed definition bundles** | When merge-to-live latency becomes a complaint, or long-lived vendor sessions cannot tolerate rolling deploys | `DefinitionSource` port already accommodates it. |
+- `libs/core`, `definition`, `policy`, `identity`, `connectors` (gRPC), `audit`, `dispatch`
+- `apps/gateway`: Streamable HTTP, one surface, OAuth 2.1 resource server
+- `tools/fakes/`: reference backend and fake OIDC provider
+- Two tools against one internal service: one `read`, one `write`
+- Cedar PDP and static analysis; groups from the token
+- Per-call derived intent
+- WAL on a PersistentVolume, drain to immutable blob and Log Analytics, `just explain`
+- Full §16 pipeline
 
----
+### 17.2 Deferred
 
-## 19. Slice one — scope and exit criteria
+Each gets its own spec. Nothing below has a reserved field or code path in slice
+one; adding it is an additive schema change.
 
-### 19.1 In scope
+| Subsystem | Trigger |
+|---|---|
+| Escalation / approval tickets | first tool needing per-action second-authority sign-off |
+| `prior_read` preconditions and the request-path audit index | with escalation |
+| Workload principals (mTLS) and a workload credential path | first workload consumer with a destination that accepts a non-human principal |
+| Declared and granted intent, `_meta` wire format, Enterprise SDK | first external consumer request |
+| Signed intent tokens verified by destinations | first destination that commits to verifying them |
+| Graph fallback for groups overage | first principal that exceeds the limit |
+| Field-level authorization, redaction | before any external SaaS destination |
+| External SaaS destinations (Workday) | after field-level authorization |
+| REST connector | first REST destination |
+| Orchestrator | after five hand-authored tools |
+| Behavioural eval gate, configuration UI | before non-engineers get write access |
+| Authorization-server broker | first client that cannot pre-register, or if the RFC 8707 spike fails |
+| Hash-chained audit records | an auditor requiring tamper evidence beyond WORM |
+| Go rewrite of dispatch | measured p99 overhead above 75 ms |
 
-- `libs/core`, `definition`, `policy`, `identity`, `connectors`, `audit`, `dispatch`
-- `apps/gateway`: Streamable HTTP, one surface, OAuth 2.1 resource server + mTLS
-- Reference backend and fake OIDC provider in `tools/fakes/` — **normative for
-  all tests**, which makes the slice fully buildable today
-- Two tools against one internal Azure service: one `read`, one `write`. Both
-  are required: without the write tool, OBO for a mutating call, write
-  governance, and `requires_human_principal` all go untested.
-- Cedar PDP + static analysis; `IntentResolver` (unsigned claims); audit WAL +
-  queue drain → immutable blob; `just explain`
-- Full §17.1 pipeline with a lint-only `ScanProvider`
-
-No database, and two stateful runtime components (§15.1).
-
-### 19.2 Out of scope
-
-Everything in §18.
-
-### 19.3 Exit criteria
-
-The slice is done when all of these hold:
+### 17.3 Exit criteria
 
 1. A real MCP client completes OAuth against Entra, lists exactly the tools
-   policy permits it, and executes the read tool against a real internal Azure
-   service via Entra OBO.
-2. The write tool succeeds for a human holding the required Entra group, and
-   returns `deny` with a `reason` and an actionable `remediation` for one who
-   does not — and is refused outright under a workload principal.
-3. `just explain <trace_id>` reproduces the full chain and the determining
-   policy for one allow and one deny.
-4. All nine invariants (§16.5) pass in E2E; all guardrail tests fail as expected.
-5. The Cedar static-analysis report is generated as a CI artifact.
-6. An Event Hubs outage injected in a test does not stop traffic; an unwritable
-   WAL takes the pod unready.
-7. `import-linter` passes with the §4.5 rule set, and `apps/gateway` contains no
-   logic from §12 steps 5–12.
-8. A definition referencing an unregistered destination, and one missing
-   fixtures, both fail CI.
+   policy permits, and executes the read tool against a real internal service
+   via OBO.
+2. The write tool succeeds for a human holding the group and returns `deny` with
+   a remediation, as a tool result, for one who does not. A replayed
+   non-idempotent call does not write twice.
+3. `just explain <trace_id>` reproduces the chain and determining policy for one
+   allow and one deny, from the index and from the local WAL.
+4. All eight invariants pass in E2E; all guardrail tests fail as expected.
+5. The Cedar static-analysis report is a CI artifact.
+6. An injected blob outage does not stop traffic; an unwritable WAL takes the
+   pod unready; a pod deleted mid-outage loses no record.
+7. `import-linter` passes and `apps/gateway` contains no dispatch logic.
+8. An unregistered destination and a missing `fixtures.yaml` both fail CI.
+9. The RFC 8707 spike has a written answer in `docs/mcp-compatibility.md`.
 
-### 19.4 Plan-time inputs
+### 17.4 Inputs
 
-The slice is fully specified and buildable against the in-repo reference
-backend. One input is needed before the phase that hits real infrastructure
-(exit criterion 1): **the name and proto of the first real internal Azure
-service**, plus its Entra app registration and OBO scope. Owner: platform
-engineering.
+| Input | Needed at | Owner |
+|---|---|---|
+| Name, proto, Entra app registration and OBO scope of the first internal service | P8 | platform engineering |
+| A test tenant for the RFC 8707 spike | P5 | platform engineering |
 
-This blocks only exit criterion 1. Every other criterion — including the write
-tool's authorization behaviour, all nine invariants, the guardrail tests, and the
-degradation tests — is satisfiable against the reference backend, so
-implementation can proceed in full while this input is pending.
+Everything except exit criterion 1 is satisfiable against the reference backend.
 
 ---
 
-## 20. Phased delivery
+## 18. Delivery
 
-Eleven chained PRs rather than one merge. Two rules make the chain worth the
-overhead:
+Eleven PRs, each merged green to `main`, each stating what it makes newly
+verifiable.
 
-1. **Every PR merges to `main` green and leaves the repo in a working state.**
-   No long-lived feature branch, no "will be wired up in the next PR" — a PR
-   that cannot be reviewed on its own merits is too big.
-2. **Every PR states what it makes newly *verifiable*.** Not "added the audit
-   library" but "an unfsynced audit record now fails the build."
+| PR | Scope | Newly verifiable |
+|---|---|---|
+| P0 | `uv` workspace, `just`, ruff, `mypy --strict`, pytest, `import-linter`, `libs/core` types and ports | a lib importing another lib fails CI |
+| P1 | `schemas/`, `libs/definition`, destination and client registries, guardrails | `just validate` passes on the read tool; unregistered destination, passthrough `outputSchema`, missing `idempotent`, missing fixtures all fail |
+| P2 | `tools/fakes/`: gRPC backend, fake OIDC | test substrate |
+| P3 | `libs/connectors` (gRPC from descriptors), fixture runner | a binding executes with no MCP, auth, or policy; undeclared fields dropped |
+| P4 | `libs/audit`: WAL, drain, blob and Log Analytics sinks, HMAC, OTel | I2, I5 |
+| P5 | `libs/identity`: resource server, RFC 9728 metadata, `(tid, oid)`, groups and overage; **RFC 8707 spike** | principals resolved against the fake OIDC; spike answered |
+| P6 | `libs/policy`: Cedar adapter, policy set, `Action::"list"`, static analyser | properties proven in CI; every `Decision` carries reason and remediation |
+| P7 | `apps/gateway` + `libs/dispatch` read path, `server/discover`, `tools/list` filtering, annotations, `isError` envelope | a real client lists and calls the read tool against fakes. I1, I3, I4, I7 |
+| P8 | `CredentialProvider` (OBO with federated credential) | read tool against the real service |
+| P9 | write tool, `idempotent`, dedup, group-required policy and its static assertion | I8; write succeeds with group, denies without |
+| P10 | `GovernanceHealth`, `/readyz`, PVC survival, injected outages, `just explain` | I6; exit criteria 3, 4, 6 |
 
-### 20.1 The chain
-
-```mermaid
-flowchart LR
-    P0["P0<br/>Skeleton + CI spine"] --> P1["P1<br/>Schema + validator"]
-    P0 --> P2["P2<br/>Fakes:<br/>backend + OIDC"]
-    P1 --> P3["P3<br/>Connector +<br/>fixture runner"]
-    P2 --> P3
-    P3 --> P4["P4<br/>Audit spine<br/>WAL + drain"]
-    P4 --> P5["P5<br/>Identity: edge"]
-    P4 --> P6["P6<br/>Policy: Cedar"]
-    P5 --> P7(["P7<br/>Gateway: read path<br/>DEMO-ABLE"])
-    P6 --> P7
-    P7 --> P8["P8<br/>Entra OBO"]
-    P7 --> P9["P9<br/>Write path"]
-    P8 --> P10(["P10<br/>Degradation +<br/>hardening — SLICE DONE"])
-    P9 --> P10
-```
-
-`P1‖P2` and `P5‖P6` are genuinely parallel. **P7 is the first demo-able
-milestone** — a real MCP client completing a governed call end to end. **P10
-closes the slice.**
-
-### 20.2 What each PR delivers
-
-| PR | Scope | Newly verifiable | Exit criteria |
-|---|---|---|---|
-| **P0** | `uv` workspace, `just`, ruff, `mypy --strict`, pytest, `import-linter` with the §4.5 rule set, `libs/core` types + port ABCs (no impls) | A lib importing another lib **fails CI** — architecture enforced before there is code to violate it | — |
-| **P1** | `schemas/` meta-schema with `x-edit-tier`, `libs/definition` (structural + all cross-layer rules), destinations & client registries, conformance runner, `tests/guardrails/` | `just validate` passes on one hand-authored read tool; an unregistered destination, a passthrough `outputSchema`, and a missing-fixtures tool all fail | 8 |
-| **P2** | `tools/fakes/`: gRPC reference backend + OIDC provider issuing Entra-shaped tokens | The test substrate the rest of the chain asserts against | — |
-| **P3** | `libs/connectors` (grpc), fixture runner executing definitions against the fake | A declarative binding executes with **no MCP, no auth, no policy**; undeclared response fields are dropped | — |
-| **P4** | `libs/audit`: `AuditEvent`, WAL + fsync, drain worker, blob sink, OTel wiring | `seq` gap detection; payload fidelity honours `payload_logging` | I2, I7 |
-| **P5** | `libs/identity`: `PrincipalResolver`, OAuth 2.1 resource server + RFC 9728 metadata, mTLS workload path, client registry loading | `human` vs `workload` principals resolved and distinguished against the fake OIDC | I6 |
-| **P6** | `libs/policy`: Cedar adapter, initial policy set, CI static analyzer, decision tables | Named policy properties **proven** in CI; every deny carries reason + remediation | I9 |
-| **P7** | `apps/gateway` + `libs/dispatch` steps 5–12 (read path), surface routing, `tools/list` filtering, generated annotations | **A real MCP client lists and calls the read tool end to end against fakes.** No backend call without a prior fsynced `open` | I1, I3, I4 |
-| **P8** | `entra_obo` `CredentialProvider`, workload identity federation, intent-keyed credential cache | Read tool against the **real** internal service; a credential cannot cross intents | I5, **1** |
-| **P9** | Write tool definition, `requires_human_principal`, group-required policy + its static assertion, deny + remediation envelope | Write succeeds with the group, denies actionably without it, refused under a workload principal | **2** |
-| **P10** | `GovernanceHealth` + `/readyz`, WAL-unwritable → unready, entity-cache max-staleness, injected sink outage, `just explain` complete | A sink outage does not stop traffic; an unwritable WAL takes the pod out | **3, 6** |
-
-### 20.3 Sequencing rationale
-
-Three choices worth defending, since a reviewer will reasonably question them:
-
-**Architecture enforcement lands in P0, before any code.** `import-linter` on an
-almost-empty repo looks like ceremony, but P6 depends on it being impossible to
-reach for a shortcut under deadline pressure. Retrofitted boundary rules fail on
-day one against a hundred violations and get switched off.
-
-**Audit (P4) precedes both identity and policy.** It is tempting to build
-identity first because it feels foundational. But invariant I1 is an *ordering*
-property between the audit write and the backend call — if audit arrives last it
-gets bolted onto an existing call path rather than constraining its shape, which
-is how "we log after the call" becomes permanent.
-
-**The write path (P9) is deliberately after OBO (P8), not bundled with it.** P8
-proves delegation against a real service on the read path, where a bug is
-recoverable. Bundling the first mutating call with the first real credential
-exchange means two novel mechanisms failing together, in a PR touching real HR
-data.
-
-### 20.4 Relationship to the implementation plan
-
-This section is the delivery *shape*. The `writing-plans` step turns each PR into
-tasks with TDD steps and review checkpoints; §20.2's "newly verifiable" column is
-the acceptance criterion each phase's tests must satisfy.
+P1‖P2 and P5‖P6 run in parallel. P7 is the first demo. Audit (P4) precedes
+identity and policy so that I1 constrains the shape of the call path rather than
+being bolted on. The write path (P9) follows OBO (P8) so the first mutating call
+and the first real credential exchange are not debugged together.
